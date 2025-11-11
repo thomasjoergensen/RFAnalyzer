@@ -2,6 +2,8 @@ package com.mantz_it.rfanalyzer.ui
 
 import android.Manifest
 import android.annotation.SuppressLint
+import android.app.NotificationManager
+import android.app.PendingIntent
 import android.content.ActivityNotFoundException
 import android.content.BroadcastReceiver
 import android.content.ComponentName
@@ -20,6 +22,7 @@ import android.os.IBinder
 import android.provider.OpenableColumns
 import android.util.Log
 import android.widget.Toast
+import androidx.core.app.NotificationCompat
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.ActivityResultLauncher
@@ -60,6 +63,7 @@ import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
 import com.mantz_it.rfanalyzer.BuildConfig
 import com.mantz_it.rfanalyzer.LogcatLogger
+import com.mantz_it.rfanalyzer.R
 import com.mantz_it.rfanalyzer.analyzer.AnalyzerService
 import com.mantz_it.rfanalyzer.database.AppStateRepository
 import com.mantz_it.rfanalyzer.database.BillingRepositoryInterface
@@ -128,6 +132,7 @@ class MainActivity: ComponentActivity() {
     // Activity Launchers
     private lateinit var startRtlsdrDriverLauncher: ActivityResultLauncher<Intent>
     private lateinit var openIQFileLauncher: ActivityResultLauncher<Intent>
+    private lateinit var selectRecordingDirLauncher: ActivityResultLauncher<Uri?>
 
     companion object {
         private const val TAG = "MainActivity"
@@ -456,19 +461,77 @@ class MainActivity: ComponentActivity() {
                     is UiAction.OnShareLogFileClicked -> shareFile(File(filesDir, LogcatLogger.logfileName), "text/plain", "Share log file via")
                     is UiAction.OnStartRecordingClicked -> if(isBound) analyzerService?.startRecording()
                     is UiAction.OnStopRecordingClicked -> if(isBound) analyzerService?.stopRecording()
+                    is UiAction.OnChooseRecordingDirectoryClicked -> selectRecordingDirLauncher.launch(null)
                     is UiAction.OnDeleteRecordingClicked -> {
-                        val file = File(action.filePath)
-                        if(file.exists()) file.delete()
-                        else Log.e(TAG, "UiAction.OnDeleteRecordingClicked: File ${file.absoluteFile} [i.e. ${action.filePath}] does not exist")
+                        // Handle both File paths and content:// URIs
+                        if (action.filePath.startsWith("content://")) {
+                            try {
+                                val uri = Uri.parse(action.filePath)
+                                val docFile = androidx.documentfile.provider.DocumentFile.fromSingleUri(this@MainActivity, uri)
+                                if (docFile != null && docFile.exists()) {
+                                    val deleted = docFile.delete()
+                                    if (deleted) {
+                                        Log.i(TAG, "UiAction.OnDeleteRecordingClicked: Successfully deleted SAF file")
+                                    } else {
+                                        Log.e(TAG, "UiAction.OnDeleteRecordingClicked: Failed to delete SAF file")
+                                    }
+                                } else {
+                                    Log.e(TAG, "UiAction.OnDeleteRecordingClicked: SAF file does not exist: ${action.filePath}")
+                                }
+                            } catch (e: Exception) {
+                                Log.e(TAG, "UiAction.OnDeleteRecordingClicked: Error deleting SAF file: ${e.message}", e)
+                            }
+                        } else {
+                            val file = File(action.filePath)
+                            if(file.exists()) file.delete()
+                            else Log.e(TAG, "UiAction.OnDeleteRecordingClicked: File ${file.absoluteFile} [i.e. ${action.filePath}] does not exist")
+                        }
                     }
                     is UiAction.OnDeleteAllRecordingsClicked -> {
                         recordingsDir.deleteRecursively()
                         recordingsDir.mkdirs()
                     }
                     is UiAction.RenameFile -> renameFile(action.file, action.newName)
-                    is UiAction.OnSaveRecordingClicked -> saveFileToUserDirectory(this@MainActivity, action.destUri, File(action.filename))
-                    is UiAction.OnShareRecordingClicked -> shareFile(File(action.filename), "application/octet-stream", "Share recording via")
+                    is UiAction.OnSaveRecordingClicked -> {
+                        // Handle both File paths and content:// URIs
+                        if (action.filename.startsWith("content://")) {
+                            try {
+                                val sourceUri = Uri.parse(action.filename)
+                                contentResolver.openInputStream(sourceUri)?.use { inputStream ->
+                                    contentResolver.openOutputStream(action.destUri)?.use { outputStream ->
+                                        inputStream.copyTo(outputStream)
+                                        Log.i(TAG, "UiAction.OnSaveRecordingClicked: Successfully saved SAF file")
+                                    }
+                                }
+                            } catch (e: Exception) {
+                                Log.e(TAG, "UiAction.OnSaveRecordingClicked: Error saving SAF file: ${e.message}", e)
+                            }
+                        } else {
+                            saveFileToUserDirectory(this@MainActivity, action.destUri, File(action.filename))
+                        }
+                    }
+                    is UiAction.OnShareRecordingClicked -> {
+                        // Handle both File paths and content:// URIs
+                        if (action.filename.startsWith("content://")) {
+                            try {
+                                val uri = Uri.parse(action.filename)
+                                val shareIntent = Intent(Intent.ACTION_SEND).apply {
+                                    type = "application/octet-stream"
+                                    putExtra(Intent.EXTRA_STREAM, uri)
+                                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                }
+                                startActivity(Intent.createChooser(shareIntent, "Share recording via"))
+                            } catch (e: Exception) {
+                                Log.e(TAG, "UiAction.OnShareRecordingClicked: Error sharing SAF file: ${e.message}", e)
+                            }
+                        } else {
+                            shareFile(File(action.filename), "application/octet-stream", "Share recording via")
+                        }
+                    }
                     is UiAction.OnBuyFullVersionClicked -> mainViewModel.buyFullVersion(this@MainActivity)
+                    is UiAction.ShowRecordingFinishedNotification -> {
+                        showRecordingFinishedNotification(action.recordingName, action.sizeInBytes)
+                    }
                     null -> Log.e(TAG, "mainViewModel.uiActions.collect: action is NULL!")
                 }
             }
@@ -522,6 +585,32 @@ class MainActivity: ComponentActivity() {
                 Log.d(TAG, "openIQFileLauncher result: URI: $uri")
                 if (uri != null)
                     setFileSourceFromContentUri(uri)
+            }
+        }
+
+        // Initialize the launcher for selecting recording directory
+        selectRecordingDirLauncher = registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri: Uri? ->
+            if (uri != null) {
+                try {
+                    // Take persistable URI permission
+                    contentResolver.takePersistableUriPermission(
+                        uri,
+                        Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                    )
+
+                    // Save to DataStore
+                    lifecycleScope.launch {
+                        appStateRepository.recordingDirectoryUri.set(uri.toString())
+                    }
+
+                    Toast.makeText(this, "Recording folder set: ${uri.path}", Toast.LENGTH_SHORT).show()
+                    Log.i(TAG, "selectRecordingDirLauncher: Recording directory set to: $uri")
+                } catch (e: Exception) {
+                    Log.e(TAG, "selectRecordingDirLauncher: Failed to take persistable URI permission: ${e.message}")
+                    Toast.makeText(this, "Failed to set recording folder: ${e.message}", Toast.LENGTH_LONG).show()
+                }
+            } else {
+                Log.d(TAG, "selectRecordingDirLauncher: No directory selected")
             }
         }
 
@@ -775,6 +864,40 @@ class MainActivity: ComponentActivity() {
             Log.e(TAG, "renameFile: Failed to rename file from ${file.absolutePath} to ${newFile.absolutePath}")
         }
         return success
+    }
+
+    private fun showRecordingFinishedNotification(recordingName: String, sizeInBytes: Long) {
+        Log.i(TAG, "showRecordingFinishedNotification: Posting notification for recording: $recordingName")
+
+        // Intent to open the Recordings screen when notification is tapped
+        val intent = Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+            putExtra("navigate_to", "recordings")  // Optional: can be used to navigate directly to recordings
+        }
+        val pendingIntent = PendingIntent.getActivity(
+            this, 0, intent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        // Format file size
+        val sizeStr = when {
+            sizeInBytes < 1024 -> "$sizeInBytes B"
+            sizeInBytes < 1024 * 1024 -> "${sizeInBytes / 1024} KB"
+            sizeInBytes < 1024 * 1024 * 1024 -> "${sizeInBytes / (1024 * 1024)} MB"
+            else -> "${sizeInBytes / (1024 * 1024 * 1024)} GB"
+        }
+
+        val notification = NotificationCompat.Builder(this, "RECORDING_CHANNEL")
+            .setSmallIcon(R.drawable.circle)  // Use a small icon
+            .setContentTitle("Recording Finished")
+            .setContentText("$recordingName ($sizeStr)")
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setContentIntent(pendingIntent)
+            .setAutoCancel(true)  // Dismiss notification when tapped
+            .setVibrate(longArrayOf(0, 250, 250, 250))  // Vibration pattern
+            .build()
+
+        val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        notificationManager.notify(2, notification)  // Use ID 2 (ID 1 is for foreground service)
     }
 
 }

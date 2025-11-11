@@ -40,12 +40,26 @@ class RFAnalyzerApplication : Application() {
     }
 
     private fun createNotificationChannel() {
+        val manager = getSystemService(NotificationManager::class.java)
+
+        // Channel for foreground service (low priority, no vibration)
         val serviceChannel = NotificationChannel(
             "SERVICE_CHANNEL",
             "Foreground Service Channel",
             NotificationManager.IMPORTANCE_LOW
         )
-        val manager = getSystemService(NotificationManager::class.java)
         manager.createNotificationChannel(serviceChannel)
+
+        // Channel for recording events (high priority, enables vibration for smartwatch)
+        val recordingChannel = NotificationChannel(
+            "RECORDING_CHANNEL",
+            "Recording Events",
+            NotificationManager.IMPORTANCE_HIGH
+        ).apply {
+            description = "Notifications for recording start/stop events"
+            enableVibration(true)
+            vibrationPattern = longArrayOf(0, 250, 250, 250)  // Vibrate: 250ms on, 250ms off, 250ms on
+        }
+        manager.createNotificationChannel(recordingChannel)
     }
 }

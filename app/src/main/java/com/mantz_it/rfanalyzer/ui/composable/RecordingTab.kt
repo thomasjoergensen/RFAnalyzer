@@ -90,7 +90,8 @@ data class RecordingTabActions(
     val onStopAfterThresholdChanged: (Int) -> Unit,
     val onStopAfterUnitChanged: (StopAfterUnit) -> Unit,
     val onStartRecordingClicked: () -> Unit,
-    val onViewRecordingsClicked: () -> Unit
+    val onViewRecordingsClicked: () -> Unit,
+    val onChooseRecordingDirectoryClicked: () -> Unit
 )
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -111,6 +112,7 @@ fun RecordingTabComposable(
     currentRecordingFileSize: Long,
     recordingsTotalFileSize: Long,
     recordingStartedTimestamp: Long,
+    recordingDirectoryUri: String,
     recordingTabActions: RecordingTabActions
 ) {
     var currentTime by remember { mutableStateOf(System.currentTimeMillis()) }
@@ -136,6 +138,29 @@ fun RecordingTabComposable(
                 Icon(
                     imageVector = Icons.Default.Menu,
                     contentDescription = "View Recordings"
+                )
+            }
+        }
+        Button(
+            onClick = recordingTabActions.onChooseRecordingDirectoryClicked,
+            shape = MaterialTheme.shapes.small,
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(55.dp)
+                .padding(vertical = 3.dp)
+        ) {
+            Row {
+                Icon(
+                    painter = painterResource(R.drawable.folder_open),
+                    contentDescription = "Choose Folder",
+                    modifier = Modifier.padding(end = 8.dp)
+                )
+                Text(
+                    text = if (recordingDirectoryUri.isEmpty())
+                        "Choose Recording Folder"
+                    else
+                        "Recording Folder: Custom",
+                    modifier = Modifier.padding(horizontal = 8.dp)
                 )
             }
         }
@@ -332,6 +357,7 @@ fun RecordingTabPreview() {
                 currentRecordingFileSize = 0,
                 recordingsTotalFileSize = 0,
                 recordingStartedTimestamp = 0,
+                recordingDirectoryUri = "",
                 recordingTabActions = RecordingTabActions(
                     onNameChanged = { },
                     onOnlyRecordWhenSquelchIsSatisfiedChanged = { },
@@ -339,7 +365,8 @@ fun RecordingTabPreview() {
                     onStopAfterThresholdChanged = { },
                     onStopAfterUnitChanged = { },
                     onStartRecordingClicked = { },
-                    onViewRecordingsClicked = { }
+                    onViewRecordingsClicked = { },
+                    onChooseRecordingDirectoryClicked = { }
                 ),
             )
         }

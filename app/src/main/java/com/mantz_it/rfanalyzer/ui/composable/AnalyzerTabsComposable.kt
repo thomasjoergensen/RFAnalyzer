@@ -143,6 +143,7 @@ fun AnalyzerTabsComposable(
     val recordingstopAfterUnit by appStateRepository.recordingstopAfterUnit.stateFlow.collectAsState()
     val recordingCurrentFileSize by appStateRepository.recordingCurrentFileSize.stateFlow.collectAsState()
     val recordingStartedTimestamp by appStateRepository.recordingStartedTimestamp.stateFlow.collectAsState()
+    val recordingDirectoryUri by appStateRepository.recordingDirectoryUri.stateFlow.collectAsState()
     val screenOrientation by appStateRepository.screenOrientation.stateFlow.collectAsState()
     val fontSize by appStateRepository.fontSize.stateFlow.collectAsState()
     val colorTheme by appStateRepository.colorTheme.stateFlow.collectAsState()
@@ -276,6 +277,7 @@ fun AnalyzerTabsComposable(
                         currentRecordingFileSize = recordingCurrentFileSize,
                         recordingsTotalFileSize = totalRecordingSizeInBytes,
                         recordingStartedTimestamp = recordingStartedTimestamp,
+                        recordingDirectoryUri = recordingDirectoryUri,
                         recordingTabActions = recordingTabActions
                     )
                 AnalyzerTabs.SETTINGS

@@ -562,10 +562,74 @@ class AnalyzerService : Service() {
         }
         val recordingStartedTimestamp = System.currentTimeMillis()
         val filename = "ongoing_recording.iq"
-        val filepath = "$RECORDINGS_DIRECTORY/$filename"
-        Log.i(TAG, "startRecording: Opening file $filepath")
-        val file = File(this.filesDir, filepath)
-        val bufferedOutputStream = BufferedOutputStream(FileOutputStream(file))
+
+        // Check if user has selected custom directory via SAF
+        val customDirUriStr = appStateRepository.recordingDirectoryUri.value
+
+        val outputStreamAndRef: Pair<BufferedOutputStream, Any>? = if (customDirUriStr.isNotEmpty()) {
+            // Use SAF to write to user-selected directory
+            try {
+                val treeUri = android.net.Uri.parse(customDirUriStr)
+                val docTree = androidx.documentfile.provider.DocumentFile.fromTreeUri(this, treeUri)
+
+                if (docTree == null || !docTree.canWrite()) {
+                    Log.e(TAG, "startRecording: Cannot write to selected directory")
+                    appStateRepository.emitAnalyzerEvent(
+                        AppStateRepository.AnalyzerEvent.SourceFailure(
+                            "Cannot write to recording directory. Please re-select folder in Recording tab."
+                        )
+                    )
+                    return
+                }
+
+                // Delete existing file if it exists
+                val existingFile = docTree.findFile(filename)
+                existingFile?.delete()
+
+                // Create new file
+                val docFile = docTree.createFile("application/octet-stream", filename)
+                if (docFile == null) {
+                    Log.e(TAG, "startRecording: Failed to create file in selected directory")
+                    appStateRepository.emitAnalyzerEvent(
+                        AppStateRepository.AnalyzerEvent.SourceFailure(
+                            "Failed to create recording file. Please re-select folder in Recording tab."
+                        )
+                    )
+                    return
+                }
+
+                val outputStream = contentResolver.openOutputStream(docFile.uri)
+                if (outputStream == null) {
+                    Log.e(TAG, "startRecording: Failed to open output stream for SAF file")
+                    return
+                }
+
+                Log.i(TAG, "startRecording: Recording to custom directory: ${docFile.uri}")
+                Pair(BufferedOutputStream(outputStream), docFile.uri)
+            } catch (e: Exception) {
+                Log.e(TAG, "startRecording: Error accessing custom directory: ${e.message}", e)
+                appStateRepository.emitAnalyzerEvent(
+                    AppStateRepository.AnalyzerEvent.SourceFailure(
+                        "Error accessing recording directory: ${e.message}"
+                    )
+                )
+                return
+            }
+        } else {
+            // Use internal storage (existing behavior)
+            val filepath = "$RECORDINGS_DIRECTORY/$filename"
+            Log.i(TAG, "startRecording: Recording to internal storage: $filepath")
+            val file = File(this.filesDir, filepath)
+            Pair(BufferedOutputStream(FileOutputStream(file)), file)
+        }
+
+        if (outputStreamAndRef == null) {
+            Log.e(TAG, "startRecording: Failed to create output stream")
+            return
+        }
+
+        val (bufferedOutputStream, fileRef) = outputStreamAndRef
+
         var maxRecordingTimeMilliseconds: Long? = null
         var maxRecordingFileSizeBytes: Long? = null
         when(appStateRepository.recordingstopAfterUnit.value) {
@@ -580,7 +644,7 @@ class AnalyzerService : Service() {
             onlyWhenSquelchIsSatisfied = appStateRepository.recordOnlyWhenSquelchIsSatisfied.value,
             maxRecordingTime = maxRecordingTimeMilliseconds,
             maxRecordingFileSize = maxRecordingFileSizeBytes,
-            onRecordingStopped = { finalSize -> appStateRepository.emitAnalyzerEvent(AppStateRepository.AnalyzerEvent.RecordingFinished(finalSize, file)) },
+            onRecordingStopped = { finalSize -> appStateRepository.emitAnalyzerEvent(AppStateRepository.AnalyzerEvent.RecordingFinished(finalSize, fileRef)) },
             onFileSizeUpdate = appStateRepository.recordingCurrentFileSize::set
         )
         // update ui

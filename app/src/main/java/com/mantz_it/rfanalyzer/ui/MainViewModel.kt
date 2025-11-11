@@ -1,6 +1,7 @@
 package com.mantz_it.rfanalyzer.ui
 
 import android.app.Activity
+import android.content.Context
 import android.net.Uri
 import android.os.Build
 import android.util.Log
@@ -33,6 +34,7 @@ import com.mantz_it.rfanalyzer.ui.composable.asStringWithUnit
 import com.mantz_it.rfanalyzer.ui.composable.saturationFunction
 import com.mantz_it.rfanalyzer.ui.screens.RecordingScreenActions
 import dagger.hilt.android.lifecycle.HiltViewModel
+import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -88,6 +90,7 @@ sealed class AppScreen(val route: String, open val subUrl: String = "") {
 
 @HiltViewModel
 class MainViewModel @Inject constructor(
+    @ApplicationContext private val context: Context,
     private val appStateRepository: AppStateRepository,
     private val recordingDao:RecordingDao,
     private val billingRepository: BillingRepositoryInterface
@@ -111,6 +114,7 @@ class MainViewModel @Inject constructor(
         data object OnDeleteLogFileClicked: UiAction()
         data object OnStartRecordingClicked: UiAction()
         data object OnStopRecordingClicked: UiAction()
+        data object OnChooseRecordingDirectoryClicked: UiAction()
         data class OnDeleteRecordingClicked(val filePath: String): UiAction()
         data object OnDeleteAllRecordingsClicked: UiAction()
         data class OnSaveRecordingClicked(val filename: String, val destUri: Uri): UiAction()
@@ -119,6 +123,7 @@ class MainViewModel @Inject constructor(
         data class ShowDialog(val title: String, val msg: String, val positiveButton: String? = null, val negativeButton: String? = null, val action: (() -> Unit)? = null): UiAction()
         data object ShowDonationDialog: UiAction()
         data object OnBuyFullVersionClicked: UiAction()
+        data class ShowRecordingFinishedNotification(val recordingName: String, val sizeInBytes: Long): UiAction()
     }
     private fun sendActionToUi(uiAction: UiAction){ viewModelScope.launch { _uiActions.emit(uiAction) } }
 
@@ -156,8 +161,10 @@ class MainViewModel @Inject constructor(
                     buttonText = "Undo",
                     callback = { snackbarResult ->
                         if (snackbarResult == SnackbarResult.ActionPerformed) {
+                            Log.i(TAG, "deleteRecordingWithUndo: User clicked Undo, restoring recording")
                             insertRecording(recording)
                         } else {
+                            Log.i(TAG, "deleteRecordingWithUndo: Snackbar dismissed, deleting file: ${recording.filePath}")
                             sendActionToUi(UiAction.OnDeleteRecordingClicked(recording.filePath))
                         }
                     }
@@ -454,7 +461,8 @@ class MainViewModel @Inject constructor(
                 sendActionToUi(UiAction.OnStartRecordingClicked)
             }
         },
-        onViewRecordingsClicked = { navigate(AppScreen.RecordingScreen) }
+        onViewRecordingsClicked = { navigate(AppScreen.RecordingScreen) },
+        onChooseRecordingDirectoryClicked = { sendActionToUi(UiAction.OnChooseRecordingDirectoryClicked) }
     )
 
     val settingsTabActions = SettingsTabActions(
@@ -532,7 +540,22 @@ class MainViewModel @Inject constructor(
                 if(!appStateRepository.analyzerRunning.value) {
                     appStateRepository.sourceType.set(SourceType.FILESOURCE)
                     appStateRepository.filesourceUri.set(recording.filePath)
-                    appStateRepository.filesourceFilename.set(File(recording.filePath).name)
+
+                    // Extract filename - handle both File paths and content:// URIs
+                    val filename = if (recording.filePath.startsWith("content://")) {
+                        try {
+                            val uri = Uri.parse(recording.filePath)
+                            val docFile = androidx.documentfile.provider.DocumentFile.fromSingleUri(context, uri)
+                            docFile?.name ?: "recording.iq"
+                        } catch (e: Exception) {
+                            Log.e(TAG, "playRecording: Error getting filename from URI: ${e.message}", e)
+                            "recording.iq"
+                        }
+                    } else {
+                        File(recording.filePath).name
+                    }
+                    appStateRepository.filesourceFilename.set(filename)
+
                     appStateRepository.sourceFrequency.set(recording.frequency)
                     appStateRepository.sourceSampleRate.set(recording.sampleRate)
                     appStateRepository.filesourceFileFormat.set(recording.fileFormat)
@@ -634,6 +657,85 @@ class MainViewModel @Inject constructor(
             appStateRepository.analyzerEvents.collect { event ->
                 when (event) {
                     is AppStateRepository.AnalyzerEvent.RecordingFinished -> {
+                        // Handle both File (internal storage) and Uri (SAF) references
+                        val fileRef = event.recordingFileRef
+                        val customDirUri = appStateRepository.recordingDirectoryUri.value
+
+                        val finalFilePath: String = if (fileRef is android.net.Uri) {
+                            // SAF file - rename it using the tree URI
+                            try {
+                                // Get the tree URI (directory) from settings
+                                val treeUri = android.net.Uri.parse(customDirUri)
+                                val docTree = androidx.documentfile.provider.DocumentFile.fromTreeUri(context, treeUri)
+
+                                if (docTree == null) {
+                                    Log.e(TAG, "RecordingFinished: Could not get directory DocumentFile from tree URI")
+                                    fileRef.toString()
+                                } else {
+                                    // Find the ongoing_recording.iq file in the directory
+                                    val ongoingFile = docTree.findFile("ongoing_recording.iq")
+
+                                    if (ongoingFile == null) {
+                                        Log.e(TAG, "RecordingFinished: Could not find ongoing_recording.iq in directory")
+                                        fileRef.toString()
+                                    } else {
+                                        val finalFilename = Recording(
+                                            name = appStateRepository.recordingName.value,
+                                            frequency = appStateRepository.sourceFrequency.value,
+                                            sampleRate = appStateRepository.sourceSampleRate.value,
+                                            date = appStateRepository.recordingStartedTimestamp.value,
+                                            fileFormat = when(appStateRepository.sourceType.value) {
+                                                SourceType.HACKRF -> FilesourceFileFormat.HACKRF
+                                                SourceType.RTLSDR -> FilesourceFileFormat.RTLSDR
+                                                SourceType.AIRSPY -> FilesourceFileFormat.AIRSPY
+                                                SourceType.HYDRASDR -> FilesourceFileFormat.HYDRASDR
+                                                SourceType.FILESOURCE -> appStateRepository.filesourceFileFormat.value
+                                            },
+                                            sizeInBytes = 0L,
+                                            filePath = "",
+                                            favorite = false
+                                        ).calculateFileName()
+
+                                        val renamed = ongoingFile.renameTo(finalFilename)
+                                        if (renamed) {
+                                            Log.i(TAG, "RecordingFinished: Successfully renamed to $finalFilename")
+                                            // Return the new URI after rename
+                                            ongoingFile.uri.toString()
+                                        } else {
+                                            Log.e(TAG, "RecordingFinished: Failed to rename file to $finalFilename")
+                                            fileRef.toString()
+                                        }
+                                    }
+                                }
+                            } catch (e: Exception) {
+                                Log.e(TAG, "RecordingFinished: Exception while renaming SAF file: ${e.message}", e)
+                                fileRef.toString()
+                            }
+                        } else if (fileRef is File) {
+                            // Internal storage file - rename as before
+                            val newRecording = Recording(
+                                name = appStateRepository.recordingName.value,
+                                frequency = appStateRepository.sourceFrequency.value,
+                                sampleRate = appStateRepository.sourceSampleRate.value,
+                                date = appStateRepository.recordingStartedTimestamp.value,
+                                fileFormat = when(appStateRepository.sourceType.value) {
+                                    SourceType.HACKRF -> FilesourceFileFormat.HACKRF
+                                    SourceType.RTLSDR -> FilesourceFileFormat.RTLSDR
+                                    SourceType.AIRSPY -> FilesourceFileFormat.AIRSPY
+                                    SourceType.HYDRASDR -> FilesourceFileFormat.HYDRASDR
+                                    SourceType.FILESOURCE -> appStateRepository.filesourceFileFormat.value
+                                },
+                                sizeInBytes = 0L,
+                                filePath = "",
+                                favorite = false
+                            )
+                            sendActionToUi(UiAction.RenameFile(fileRef, newRecording.calculateFileName()))
+                            "${fileRef.parent}/${newRecording.calculateFileName()}"
+                        } else {
+                            Log.e(TAG, "RecordingFinished: Unknown file reference type: ${fileRef.javaClass.name}")
+                            ""
+                        }
+
                         val newRecording = Recording(
                             name = appStateRepository.recordingName.value,
                             frequency = appStateRepository.sourceFrequency.value,
@@ -647,14 +749,20 @@ class MainViewModel @Inject constructor(
                                 SourceType.FILESOURCE -> appStateRepository.filesourceFileFormat.value
                             },
                             sizeInBytes = event.finalSize,
-                            filePath = event.recordingFile.absolutePath,
+                            filePath = finalFilePath,
                             favorite = false
                         )
-                        sendActionToUi(UiAction.RenameFile(event.recordingFile, newRecording.calculateFileName()))
-                        val newFilePath = "${event.recordingFile.parent}/${newRecording.calculateFileName()}"
-                        insertRecording(newRecording.copy(filePath = newFilePath)) { insertedRecording ->
+
+                        insertRecording(newRecording) { insertedRecording ->
                             appStateRepository.recordingStartedTimestamp.set(0L)
                             appStateRepository.recordingRunning.set(false)
+
+                            // Show notification for smartwatch/wearables
+                            sendActionToUi(UiAction.ShowRecordingFinishedNotification(
+                                insertedRecording.name,
+                                insertedRecording.sizeInBytes
+                            ))
+
                             showSnackbar(SnackbarEvent(
                                 message = "Recording '${insertedRecording.name}' finished (${insertedRecording.sizeInBytes.asSizeInBytesToString()})",
                                 buttonText = "Delete Recording",

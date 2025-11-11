@@ -237,6 +237,7 @@ class AppStateRepository @Inject constructor(
     val recordingstopAfterUnit = Setting("recordingStopAfterUnit", StopAfterUnit.NEVER, scope, dataStore)
     val recordingCurrentFileSize = MutableState(0L)
     val recordingStartedTimestamp = MutableState(0L)
+    val recordingDirectoryUri = Setting("recordingDirectoryUri", "", scope, dataStore) // Empty = use internal storage, otherwise SAF content:// URI
 
     // Settings Tab
     val screenOrientation = Setting("screenOrientation", ScreenOrientation.AUTO, scope, dataStore)
@@ -293,7 +294,7 @@ class AppStateRepository @Inject constructor(
     private val _analyzerEvents = MutableSharedFlow<AnalyzerEvent?>()
     val analyzerEvents: SharedFlow<AnalyzerEvent?> = _analyzerEvents
     sealed class AnalyzerEvent {
-        data class RecordingFinished(val finalSize: Long, val recordingFile: File): AnalyzerEvent()
+        data class RecordingFinished(val finalSize: Long, val recordingFileRef: Any): AnalyzerEvent()  // Can be File or Uri
         data class SourceFailure(val message: String): AnalyzerEvent()
     }
     fun emitAnalyzerEvent(event: AnalyzerEvent){ scope.launch { _analyzerEvents.emit(event) } }
