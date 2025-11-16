@@ -532,6 +532,46 @@ class MainActivity: ComponentActivity() {
                     is UiAction.ShowRecordingFinishedNotification -> {
                         showRecordingFinishedNotification(action.recordingName, action.sizeInBytes)
                     }
+                    // Multi-device actions
+                    is UiAction.OnStartDeviceClicked -> {
+                        if (isBound) {
+                            Log.i(TAG, "OnStartDeviceClicked: Starting device ${action.deviceId}")
+                            val sourceType = action.deviceId.split("_").firstOrNull()?.uppercase()?.let {
+                                try { SourceType.valueOf(it) } catch (e: Exception) { null }
+                            } ?: SourceType.AIRSPY
+                            analyzerService?.startDevice(sourceType, action.deviceId)
+                            updateActiveDevicesList()
+                        }
+                    }
+                    is UiAction.OnStopDeviceClicked -> {
+                        if (isBound) {
+                            Log.i(TAG, "OnStopDeviceClicked: Stopping device ${action.deviceId}")
+                            analyzerService?.stopDevice(action.deviceId)
+                            updateActiveDevicesList()
+                        }
+                    }
+                    is UiAction.OnAddDeviceClicked -> {
+                        if (isBound) {
+                            // Generate unique device ID
+                            val deviceIds = analyzerService?.getActiveDeviceIds() ?: emptyList()
+                            val existingCount = deviceIds.count { it.startsWith(action.sourceType.name.lowercase()) }
+                            val deviceId = "${action.sourceType.name.lowercase()}_$existingCount"
+                            Log.i(TAG, "OnAddDeviceClicked: Adding device $deviceId of type ${action.sourceType}")
+                            analyzerService?.startDevice(action.sourceType, deviceId)
+                            // Update device list after a short delay (allow device to start)
+                            lifecycleScope.launch {
+                                delay(500)
+                                updateActiveDevicesList()
+                            }
+                        }
+                    }
+                    is UiAction.OnSelectDeviceForDisplay -> {
+                        if (isBound) {
+                            Log.i(TAG, "OnSelectDeviceForDisplay: Selecting device ${action.deviceId}")
+                            analyzerService?.setActiveDevice(action.deviceId)
+                            appStateRepository.activeDeviceId.set(action.deviceId)
+                        }
+                    }
                     null -> Log.e(TAG, "mainViewModel.uiActions.collect: action is NULL!")
                 }
             }
@@ -738,6 +778,35 @@ class MainActivity: ComponentActivity() {
         } else {
             Log.w(TAG, "onStopClickedAction: Service is not bound! Cannot stop Analyzer")
         }
+    }
+
+    private fun updateActiveDevicesList() {
+        if (!isBound) return
+
+        val deviceIds = analyzerService?.getActiveDeviceIds() ?: emptyList()
+        val devices = deviceIds.map { deviceId ->
+            val sourceType = deviceId.split("_").firstOrNull()?.uppercase()?.let {
+                try { SourceType.valueOf(it) } catch (e: Exception) { null }
+            } ?: SourceType.AIRSPY
+
+            AppStateRepository.DeviceInstance(
+                id = deviceId,
+                sourceType = sourceType,
+                name = sourceType.displayName,
+                isRunning = true,
+                isRecording = false,
+                frequency = 97000000L,
+                sampleRate = 10000000L
+            )
+        }
+
+        lifecycleScope.launch {
+            appStateRepository.activeDevices.emit(devices)
+            if (devices.isNotEmpty() && appStateRepository.activeDeviceId.value == null) {
+                appStateRepository.activeDeviceId.set(devices.first().id)
+            }
+        }
+        Log.d(TAG, "updateActiveDevicesList: Updated device list with ${devices.size} devices")
     }
 
     private fun onOpenIQFileClicked() {

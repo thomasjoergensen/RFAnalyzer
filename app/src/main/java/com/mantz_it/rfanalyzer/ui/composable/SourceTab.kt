@@ -78,6 +78,13 @@ data class SourceTabActions(
     val onFrequencyChanged: (newFrequency: Long) -> Unit,
     val onSampleRateChanged: (newSampleRate: Long) -> Unit,
     val onAutomaticSampleRateAdjustmentChanged: (Boolean) -> Unit,
+    // Multi-device actions
+    val onStartDeviceClicked: (deviceId: String) -> Unit = {},
+    val onStopDeviceClicked: (deviceId: String) -> Unit = {},
+    val onAddDeviceClicked: (sourceType: SourceType) -> Unit = {},
+    val onSelectDeviceForDisplay: (deviceId: String) -> Unit = {},
+    val onStartRecordingDeviceClicked: (deviceId: String) -> Unit = {},
+    val onStopRecordingDeviceClicked: (deviceId: String) -> Unit = {},
     val onHackrfVgaGainIndexChanged: (newIndex: Int) -> Unit,
     val onHackrfLnaGainIndexChanged: (newIndex: Int) -> Unit,
     val onHackrfAmplifierEnabledChanged: (Boolean) -> Unit,
@@ -115,6 +122,70 @@ data class SourceTabActions(
     val onViewRecordingsClicked: () -> Unit,
     val onFilesourceRepeatChanged: (Boolean) -> Unit
 )
+
+/**
+ * Simple multi-device management UI for prototype
+ */
+@Composable
+fun MultiDeviceSection(
+    activeDevices: List<com.mantz_it.rfanalyzer.database.AppStateRepository.DeviceInstance>,
+    activeDeviceId: String?,
+    actions: SourceTabActions,
+    modifier: Modifier = Modifier
+) {
+    androidx.compose.foundation.layout.Column(modifier = modifier.padding(8.dp)) {
+        Text(
+            "Active Devices (${activeDevices.size})",
+            style = MaterialTheme.typography.titleMedium,
+            modifier = Modifier.padding(bottom = 8.dp)
+        )
+
+        // List active devices
+        activeDevices.forEach { device ->
+            androidx.compose.foundation.layout.Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "${device.name} (${device.id})",
+                    modifier = Modifier.weight(1f),
+                    color = if (device.id == activeDeviceId) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface
+                )
+                Button(
+                    onClick = { actions.onSelectDeviceForDisplay(device.id) },
+                    modifier = Modifier.padding(horizontal = 4.dp).height(32.dp),
+                    enabled = device.id != activeDeviceId
+                ) {
+                    Text("Select", fontSize = 10.sp)
+                }
+                Button(
+                    onClick = { actions.onStopDeviceClicked(device.id) },
+                    modifier = Modifier.height(32.dp)
+                ) {
+                    Text("Stop", fontSize = 10.sp)
+                }
+            }
+        }
+
+        // Add device button
+        androidx.compose.foundation.layout.Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(top = 8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text("Add Device:", modifier = Modifier.padding(end = 8.dp))
+            Button(
+                onClick = { actions.onAddDeviceClicked(SourceType.AIRSPY) },
+                modifier = Modifier.height(36.dp)
+            ) {
+                Text("Airspy")
+            }
+        }
+    }
+}
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -169,9 +240,40 @@ fun SourceTabComposable(
     filesourceFilename: String,
     filesourceFileFormat: FilesourceFileFormat,
     filesourceRepeatEnabled: Boolean,
-    sourceTabActions: SourceTabActions
+    sourceTabActions: SourceTabActions,
+    // Multi-device parameters
+    activeDevices: List<com.mantz_it.rfanalyzer.database.AppStateRepository.DeviceInstance> = emptyList(),
+    activeDeviceId: String? = null
 ) {
     ScrollableColumnWithFadingEdge {
+        // Multi-device section (show if any devices are active)
+        if (activeDevices.isNotEmpty()) {
+            MultiDeviceSection(
+                activeDevices = activeDevices,
+                activeDeviceId = activeDeviceId,
+                actions = sourceTabActions,
+                modifier = Modifier.fillMaxWidth()
+            )
+            androidx.compose.material3.HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
+        } else {
+            // Show "Add Device" button even when no devices are active
+            androidx.compose.foundation.layout.Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("Multi-Device Mode:", modifier = Modifier.padding(end = 8.dp))
+                Button(
+                    onClick = { sourceTabActions.onAddDeviceClicked(SourceType.AIRSPY) },
+                    modifier = Modifier.height(36.dp)
+                ) {
+                    Text("Add Airspy Device")
+                }
+            }
+            androidx.compose.material3.HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
+        }
+
         Row(modifier = Modifier.fillMaxWidth()) {
             OutlinedEnumDropDown(
                 label = "Signal Source",

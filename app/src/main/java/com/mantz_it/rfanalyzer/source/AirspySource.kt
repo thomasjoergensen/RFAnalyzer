@@ -36,7 +36,9 @@ import com.mantz_it.libairspy.AirspyDevice
  * License along with this library; if not, write to the Free Software
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
-class AirspySource : IQSourceInterface {
+class AirspySource(
+    private val deviceIndex: Int = 0  // Which physical Airspy to open (0 = first, 1 = second, etc.)
+) : IQSourceInterface {
 
     companion object {
         private const val TAG = "AirspySource"
@@ -61,6 +63,8 @@ class AirspySource : IQSourceInterface {
     private var iqSourceCallback: IQSourceInterface.Callback? = null
     private var sampleRate: Int = 0
     private var frequency: Long = 0
+    private var usbPermissionReceiver: BroadcastReceiver? = null
+    private var receiverContext: Context? = null
 
     override fun getSampleRate(): Int {
         return sampleRate
@@ -159,22 +163,39 @@ class AirspySource : IQSourceInterface {
         iqSourceCallback = callback
 
         val usbManager = context.getSystemService(Context.USB_SERVICE) as UsbManager
-        val device = usbManager.deviceList.values.firstOrNull {
+        val airspyDevices = usbManager.deviceList.values.filter {
             it.vendorId == 0x1d50 && it.productId == 0x60a1
         }
-        if (device == null) {
+
+        Log.i(TAG, "open: Found ${airspyDevices.size} Airspy device(s)")
+        airspyDevices.forEachIndexed { index, dev ->
+            Log.i(TAG, "open:   [$index] ${dev.deviceName} - hasPermission: ${usbManager.hasPermission(dev)}")
+        }
+
+        if (airspyDevices.isEmpty()) {
             Log.i(TAG, "open: No Airspy device found.")
             usbManager.deviceList.values.forEach {
                 Log.i(TAG, "open: Unknown USB device: ${it.deviceName} (VendorId: ${it.vendorId}, ProductId: ${it.productId})")
             }
             return false
         }
-        Log.i(TAG, "open: device=$device (vendorid: ${device.vendorId} productId: ${device.productId})")
+
+        if (deviceIndex >= airspyDevices.size) {
+            Log.e(TAG, "open: Device index $deviceIndex out of range. Found ${airspyDevices.size} Airspy device(s).")
+            return false
+        }
+
+        val device = airspyDevices[deviceIndex]
+        Log.i(TAG, "open: Opening Airspy device index $deviceIndex: ${device.deviceName} (vendorId: ${device.vendorId} productId: ${device.productId})")
         if (usbManager.hasPermission(device)) {
             openAirspyDevice(device, context)
         } else {
+            // Unregister any previous receiver first
+            unregisterPermissionReceiver()
+
             // Register broadcast receiver BEFORE requesting permission
-            val usbPermissionReceiver = object : BroadcastReceiver() {
+            receiverContext = context
+            usbPermissionReceiver = object : BroadcastReceiver() {
                 override fun onReceive(context: Context, intent: Intent) {
                     if (ACTION_USB_PERMISSION == intent.action) {
                         synchronized(this) {
@@ -190,19 +211,20 @@ class AirspySource : IQSourceInterface {
                             }
                         }
                     }
-                    context.unregisterReceiver(this)
+                    unregisterPermissionReceiver()
                 }
             }
             val filter = IntentFilter(ACTION_USB_PERMISSION)
-            ContextCompat.registerReceiver(context, usbPermissionReceiver, filter,ContextCompat.RECEIVER_NOT_EXPORTED)
+            ContextCompat.registerReceiver(context, usbPermissionReceiver!!, filter,ContextCompat.RECEIVER_NOT_EXPORTED)
 
             // Request permission
             // Note: setting the package name of the inner intent makes it explicit
             // From Android 14 it is required that mutable PendingIntents have explicit inner intents!
             val innerIntent = Intent(ACTION_USB_PERMISSION)
             innerIntent.setPackage(context.packageName)
-            val permissionIntent = android.app.PendingIntent.getBroadcast(context, 0, innerIntent, android.app.PendingIntent.FLAG_MUTABLE)
-            Log.i(TAG, "open: requesting permission for device: $device")
+            // Use deviceIndex as request code to ensure unique PendingIntent per device
+            val permissionIntent = android.app.PendingIntent.getBroadcast(context, deviceIndex, innerIntent, android.app.PendingIntent.FLAG_MUTABLE)
+            Log.i(TAG, "open: requesting permission for device index $deviceIndex: $device")
             usbManager.requestPermission(device, permissionIntent)
         }
         return true
@@ -247,6 +269,7 @@ class AirspySource : IQSourceInterface {
     }
 
     override fun close(): Boolean {
+        unregisterPermissionReceiver()
         airspyDevice?.let {
             return it.close()
         }
@@ -361,6 +384,25 @@ class AirspySource : IQSourceInterface {
             return 0
         }
         return converter.mixPacketIntoSamplePacket(packet, samplePacket, channelFrequency)
+    }
+
+    /**
+     * Unregister the USB permission receiver if it's registered
+     */
+    private fun unregisterPermissionReceiver() {
+        usbPermissionReceiver?.let { receiver ->
+            receiverContext?.let { context ->
+                try {
+                    context.unregisterReceiver(receiver)
+                    Log.d(TAG, "unregisterPermissionReceiver: Successfully unregistered receiver")
+                } catch (e: IllegalArgumentException) {
+                    // Receiver was already unregistered
+                    Log.d(TAG, "unregisterPermissionReceiver: Receiver was already unregistered")
+                }
+            }
+        }
+        usbPermissionReceiver = null
+        receiverContext = null
     }
 
 }

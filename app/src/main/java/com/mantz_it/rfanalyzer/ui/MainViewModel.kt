@@ -124,6 +124,11 @@ class MainViewModel @Inject constructor(
         data object ShowDonationDialog: UiAction()
         data object OnBuyFullVersionClicked: UiAction()
         data class ShowRecordingFinishedNotification(val recordingName: String, val sizeInBytes: Long): UiAction()
+        // Multi-device actions
+        data class OnStartDeviceClicked(val deviceId: String): UiAction()
+        data class OnStopDeviceClicked(val deviceId: String): UiAction()
+        data class OnAddDeviceClicked(val sourceType: SourceType): UiAction()
+        data class OnSelectDeviceForDisplay(val deviceId: String): UiAction()
     }
     private fun sendActionToUi(uiAction: UiAction){ viewModelScope.launch { _uiActions.emit(uiAction) } }
 
@@ -369,6 +374,27 @@ class MainViewModel @Inject constructor(
         onViewRecordingsClicked = { navigate(AppScreen.RecordingScreen) },
         onFilesourceFileFormatChanged = appStateRepository.filesourceFileFormat::set,
         onFilesourceRepeatChanged = appStateRepository.filesourceRepeatEnabled::set,
+        // Multi-device actions
+        onStartDeviceClicked = { deviceId ->
+            sendActionToUi(UiAction.OnStartDeviceClicked(deviceId))
+        },
+        onStopDeviceClicked = { deviceId ->
+            sendActionToUi(UiAction.OnStopDeviceClicked(deviceId))
+        },
+        onAddDeviceClicked = { sourceType ->
+            sendActionToUi(UiAction.OnAddDeviceClicked(sourceType))
+        },
+        onSelectDeviceForDisplay = { deviceId ->
+            sendActionToUi(UiAction.OnSelectDeviceForDisplay(deviceId))
+        },
+        onStartRecordingDeviceClicked = { deviceId ->
+            // Start recording for specific device (to be implemented in MainActivity)
+            Log.i(TAG, "onStartRecordingDeviceClicked: $deviceId")
+        },
+        onStopRecordingDeviceClicked = { deviceId ->
+            // Stop recording for specific device (to be implemented in MainActivity)
+            Log.i(TAG, "onStopRecordingDeviceClicked: $deviceId")
+        },
     )
 
     val displayTabActions = DisplayTabActions(

@@ -75,6 +75,10 @@ class Scheduler(var fftSize: Int, private val source: IQSourceInterface) : Threa
     private var onFileSizeUpdate: ((currentFileSize: Long) -> Unit)? = null // periodical callback during recording to report file size (in bytes) to ui
     private var squelchDebounceCounter: Int = 0                             // helper counter to debounce squelch changes
 
+    // Public property to check if currently recording
+    val isRecording: Boolean
+        get() = bufferedOutputStream != null
+
     init {
         // allocate the buffer packets.
         for (i in 0 until FFT_QUEUE_SIZE) fftInputQueue.offer(

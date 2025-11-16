@@ -164,6 +164,10 @@ fun AnalyzerTabsComposable(
 
     val totalRecordingSizeInBytes by mainViewModel.totalRecordingSizeInBytes.collectAsState()
 
+    // Multi-device state
+    val activeDevices by appStateRepository.activeDevices.collectAsState()
+    val activeDeviceId by appStateRepository.activeDeviceId.stateFlow.collectAsState()
+
     Column {
         PrimaryScrollableTabRow(selectedTabIndex = state.ordinal) {
             AnalyzerTabs.entries.forEach { tab ->
@@ -227,7 +231,9 @@ fun AnalyzerTabsComposable(
                         filesourceFilename = filesourceFilename,
                         filesourceFileFormat = filesourceFileFormat,
                         filesourceRepeatEnabled = filesourceRepeatEnabled,
-                        sourceTabActions = sourceTabActions
+                        sourceTabActions = sourceTabActions,
+                        activeDevices = activeDevices,
+                        activeDeviceId = activeDeviceId
                     )
                 AnalyzerTabs.DISPLAY
                     -> DisplayTabComposable(

@@ -191,6 +191,20 @@ class AppStateRepository @Inject constructor(
     val filesourceFileFormat = MutableState(FilesourceFileFormat.HACKRF)
     val filesourceRepeatEnabled = Setting("filesourceRepeatEnabled", false, scope, dataStore)
 
+    // Multi-Device Management
+    data class DeviceInstance(
+        val id: String,                      // Unique device identifier (e.g., "airspy_0", "airspy_1")
+        val sourceType: SourceType,          // Type of SDR device
+        val name: String,                    // Display name (e.g., "Airspy R2")
+        val isRunning: Boolean = false,      // Is device currently streaming
+        val isRecording: Boolean = false,    // Is device currently recording
+        val frequency: Long = 97000000L,     // Current frequency
+        val sampleRate: Long = 10000000L     // Current sample rate
+    )
+    val activeDevices = MutableStateFlow<List<DeviceInstance>>(emptyList())  // List of all active/running devices
+    val activeDeviceId = MutableState<String?>(null)  // Currently selected device for display/demodulation
+    val availableDeviceTypes = MutableState<List<SourceType>>(SourceType.entries.filter { it != SourceType.FILESOURCE })  // Available device types for multi-device start
+
     // View Tab
     val fftSize = Setting("fftSize", 16384, scope, dataStore)
     val fftAverageLength = Setting("fftAverageLength", 0, scope, dataStore)

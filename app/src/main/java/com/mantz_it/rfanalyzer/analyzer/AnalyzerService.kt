@@ -68,6 +68,18 @@ import kotlin.math.abs
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+/**
+ * Represents a complete processing pipeline for a single SDR device
+ */
+data class DevicePipeline(
+    val id: String,                      // Unique device identifier (e.g., "hackrf_0", "rtlsdr_1")
+    val sourceType: SourceType,          // Type of SDR device
+    val source: IQSourceInterface,       // IQ source instance
+    val scheduler: Scheduler,            // Scheduler for this device
+    val demodulator: Demodulator,        // Demodulator for this device
+    val fftProcessor: FftProcessor       // FFT processor for this device
+)
+
 @AndroidEntryPoint
 class AnalyzerService : Service() {
     @Inject lateinit var appStateRepository: AppStateRepository
@@ -75,14 +87,21 @@ class AnalyzerService : Service() {
     private val binder = LocalBinder()
     private var isBound = false
 
-    var source: IQSourceInterface? = null
-        private set
-    var scheduler: Scheduler? = null
-        private set
-    var demodulator: Demodulator? = null
-        private set
-    var fftProcessor: FftProcessor? = null
-        private set
+    // Multi-device support: Map of device ID to pipeline
+    private val activePipelines = mutableMapOf<String, DevicePipeline>()
+
+    // Current active device for display/demodulation
+    private var activeDeviceId: String? = null
+
+    // Legacy compatibility: expose primary source as before
+    val source: IQSourceInterface?
+        get() = activePipelines[activeDeviceId]?.source
+    val scheduler: Scheduler?
+        get() = activePipelines[activeDeviceId]?.scheduler
+    val demodulator: Demodulator?
+        get() = activePipelines[activeDeviceId]?.demodulator
+    val fftProcessor: FftProcessor?
+        get() = activePipelines[activeDeviceId]?.fftProcessor
 
     inner class LocalBinder : Binder() {
         fun getService(): AnalyzerService = this@AnalyzerService
@@ -93,19 +112,23 @@ class AnalyzerService : Service() {
         const val ACTION_STOP = "com.mantz_it.rfanalyzer.analyzer.ACTION_STOP"
     }
 
-    private val iqSourceActions: IQSourceInterface.Callback = object : IQSourceInterface.Callback {
-        override fun onIQSourceReady(source: IQSourceInterface?) {
-            serviceScope.launch {
-                startScheduler()
+    // Map device-specific callbacks (each source gets its own callback that knows its device ID)
+    private fun createIQSourceCallback(deviceId: String): IQSourceInterface.Callback {
+        return object : IQSourceInterface.Callback {
+            override fun onIQSourceReady(source: IQSourceInterface?) {
+                serviceScope.launch {
+                    Log.d(TAG, "onIQSourceReady for device $deviceId")
+                    startSchedulerForDevice(deviceId)
+                }
             }
-        }
 
-        override fun onIQSourceError(source: IQSourceInterface?, message: String?) {
-            val errorMessage = "Error with Source (${source?.getName()}): $message"
-            Log.e(TAG, "onIQSourceError: $errorMessage")
-            serviceScope.launch {
-                appStateRepository.emitAnalyzerEvent(AppStateRepository.AnalyzerEvent.SourceFailure("Source: $message"))
-                stopAnalyzer()
+            override fun onIQSourceError(source: IQSourceInterface?, message: String?) {
+                val errorMessage = "Error with Source $deviceId (${source?.getName()}): $message"
+                Log.e(TAG, "onIQSourceError: $errorMessage")
+                serviceScope.launch {
+                    appStateRepository.emitAnalyzerEvent(AppStateRepository.AnalyzerEvent.SourceFailure("Device $deviceId: $message"))
+                    stopDevice(deviceId)
+                }
             }
         }
     }
@@ -216,35 +239,39 @@ class AnalyzerService : Service() {
     }
 
     /**
-     * Will stop the RF Analyzer. This includes shutting down the scheduler (which turns of the
-     * source) and the demodulator if running.
+     * Will stop the RF Analyzer. This includes shutting down all schedulers (which turn off the
+     * sources) and the demodulators if running.
      */
     fun stopAnalyzer() {
-        Log.i(TAG, "stopAnalyzer")
-        // Stop the Scheduler if running:
-        scheduler?.stopScheduler()
+        Log.i(TAG, "stopAnalyzer: Stopping all ${activePipelines.size} pipelines")
 
-        // Stop the Demodulator if running:
-        demodulator?.stopDemodulator()
+        // Stop all pipelines
+        activePipelines.values.forEach { pipeline ->
+            Log.d(TAG, "stopAnalyzer: Stopping pipeline ${pipeline.id}")
+            // Stop the Scheduler if running:
+            pipeline.scheduler.stopScheduler()
 
-        fftProcessor?.stopLoop()
+            // Stop the Demodulator if running:
+            pipeline.demodulator.stopDemodulator()
 
-        // Wait for the scheduler to stop:
-        try {
-            if (scheduler?.name != Thread.currentThread().name)
-                scheduler?.join()
-        } catch (e: InterruptedException) {
-            Log.e(TAG, "stopAnalyzer: Error while stopping Scheduler.")
+            pipeline.fftProcessor.stopLoop()
+
+            // Wait for the scheduler to stop:
+            try {
+                if (pipeline.scheduler.name != Thread.currentThread().name)
+                    pipeline.scheduler.join()
+            } catch (e: InterruptedException) {
+                Log.e(TAG, "stopAnalyzer: Error while stopping Scheduler for ${pipeline.id}")
+            }
+
+            // Close the source
+            pipeline.source.close()
         }
 
-        // Wait for the demodulator to stop
-        //try {
-        //    demodulator?.join()
-        //} catch (e: InterruptedException) {
-        //    Log.e(TAG, "stopAnalyzer: Error while stopping Demodulator.")
-        //}
-        source?.close()
-        source = null
+        // Clear all pipelines
+        activePipelines.clear()
+        activeDeviceId = null
+
         appStateRepository.sourceName.set("")
         appStateRepository.analyzerRunning.set(false)
         appStateRepository.analyzerStartPending.set(false)
@@ -257,53 +284,142 @@ class AnalyzerService : Service() {
      * Will start the RF Analyzer. This includes creating a source (if null), open a source
      * (if not open), starting the scheduler (which starts the source) and starting the
      * processing loop.
+     *
+     * Legacy method - now delegates to per-device start
      */
     fun startAnalyzer() : Boolean {
-        Log.d(TAG, "startAnalyzer")
-        if (source == null) {
-            if (!this.createSource()) return false
+        Log.d(TAG, "startAnalyzer (legacy)")
+        val sourceType = appStateRepository.sourceType.value
+        val deviceId = "${sourceType.name.lowercase()}_0"
+        return startDevice(sourceType, deviceId)
+    }
+
+    /**
+     * Start a specific SDR device and create its processing pipeline
+     */
+    fun startDevice(sourceType: SourceType, deviceId: String): Boolean {
+        Log.d(TAG, "startDevice: Starting device $deviceId of type $sourceType")
+
+        // Check if device is already running
+        if (activePipelines.containsKey(deviceId)) {
+            Log.w(TAG, "startDevice: Device $deviceId is already running")
+            return true
         }
 
-        // check if the source is open. if not, open it!
-        if (!source!!.isOpen()) {
-            if (!openSource()) {
-                Toast.makeText(this, "Source not available (${source?.getName()})", Toast.LENGTH_LONG).show()
-                source = null
-                appStateRepository.analyzerStartPending.set(false)
-                return false
-            }
-            return true // we have to wait for the source to become ready... onIQSourceReady() will call startScheduler()...
-        } else {
-            return startScheduler()
+        // Create the source
+        val newSource = createSourceForType(sourceType, deviceId) ?: return false
+
+        // Open the source
+        if (!openSourceForDevice(newSource, deviceId, sourceType)) {
+            Toast.makeText(this, "Source not available ($deviceId - ${newSource.getName()})", Toast.LENGTH_LONG).show()
+            appStateRepository.analyzerStartPending.set(false)
+            return false
+        }
+
+        // If source opened synchronously, start scheduler; otherwise callback will do it
+        if (newSource.isOpen()) {
+            return startSchedulerForDevice(deviceId)
+        }
+
+        return true // Waiting for onIQSourceReady callback
+    }
+
+    /**
+     * Stop a specific device pipeline
+     */
+    fun stopDevice(deviceId: String) {
+        Log.d(TAG, "stopDevice: Stopping device $deviceId")
+
+        val pipeline = activePipelines[deviceId] ?: run {
+            Log.w(TAG, "stopDevice: Device $deviceId not found")
+            return
+        }
+
+        // Stop the pipeline components
+        pipeline.scheduler.stopScheduler()
+        pipeline.demodulator.stopDemodulator()
+        pipeline.fftProcessor.stopLoop()
+
+        // Wait for scheduler to stop
+        try {
+            if (pipeline.scheduler.name != Thread.currentThread().name)
+                pipeline.scheduler.join()
+        } catch (e: InterruptedException) {
+            Log.e(TAG, "stopDevice: Error while stopping Scheduler for $deviceId")
+        }
+
+        // Close the source
+        pipeline.source.close()
+
+        // Remove from active pipelines
+        activePipelines.remove(deviceId)
+
+        // If this was the active device, clear it
+        if (activeDeviceId == deviceId) {
+            activeDeviceId = activePipelines.keys.firstOrNull()
+            Log.d(TAG, "stopDevice: Active device was stopped. New active device: $activeDeviceId")
+        }
+
+        // If no more pipelines, stop analyzer
+        if (activePipelines.isEmpty()) {
+            appStateRepository.analyzerRunning.set(false)
+            appStateRepository.analyzerStartPending.set(false)
+            stopForegroundService()
         }
     }
 
-    private fun startScheduler(): Boolean {
-        if(source == null) return false
-
-        // Ensure that source sample rate is supported:
-        val supportedSampleRates = source!!.supportedSampleRates
-        val currentSampleRate = source!!.sampleRate
-        if(!supportedSampleRates.contains(source!!.sampleRate)) {
-            val bestMatch = supportedSampleRates.minByOrNull { supportedSampleRate -> abs(supportedSampleRate - currentSampleRate) }
-            if(bestMatch == null || bestMatch == 0)
-                Log.w(TAG, "startScheduler: Source sample rate $currentSampleRate is not supported! (${supportedSampleRates})")
-            else
-                source!!.sampleRate = bestMatch
+    /**
+     * Set which device is active for display and demodulation
+     */
+    fun setActiveDevice(deviceId: String) {
+        if (!activePipelines.containsKey(deviceId)) {
+            Log.w(TAG, "setActiveDevice: Device $deviceId not found")
+            return
         }
 
-        // Source was successfully opened, let the UI know:
-        appStateRepository.sourceName.set(source!!.name)
-        appStateRepository.sourceMinimumFrequency.set(source!!.minFrequency)
-        appStateRepository.sourceMaximumFrequency.set(source!!.maxFrequency)
-        appStateRepository.sourceSupportedSampleRates.set(supportedSampleRates.map { it.toLong() })
-        appStateRepository.sourceFrequency.set(source!!.frequency)
-        appStateRepository.sourceSampleRate.set(source!!.sampleRate.toLong())
-        if (source is RtlsdrSource) {
+        Log.d(TAG, "setActiveDevice: Switching active device to $deviceId")
+        activeDeviceId = deviceId
+
+        val pipeline = activePipelines[deviceId]!!
+        appStateRepository.sourceName.set(pipeline.source.name)
+        appStateRepository.sourceFrequency.set(pipeline.source.frequency)
+        appStateRepository.sourceSampleRate.set(pipeline.source.sampleRate.toLong())
+    }
+
+    /**
+     * Get list of all active device IDs
+     */
+    fun getActiveDeviceIds(): List<String> = activePipelines.keys.toList()
+
+    /**
+     * Start scheduler for a specific device
+     */
+    private fun startSchedulerForDevice(deviceId: String): Boolean {
+        Log.d(TAG, "startSchedulerForDevice: Starting scheduler for $deviceId")
+
+        // Find if we have a temporary source waiting to be added
+        val tempSource = tempSources[deviceId] ?: run {
+            Log.e(TAG, "startSchedulerForDevice: No source found for $deviceId")
+            return false
+        }
+
+        // Ensure that source sample rate is supported:
+        val supportedSampleRates = tempSource.supportedSampleRates
+        val currentSampleRate = tempSource.sampleRate
+        if(!supportedSampleRates.contains(tempSource.sampleRate)) {
+            val bestMatch = supportedSampleRates.minByOrNull { supportedSampleRate -> abs(supportedSampleRate - currentSampleRate) }
+            if(bestMatch == null || bestMatch == 0)
+                Log.w(TAG, "startSchedulerForDevice: Source sample rate $currentSampleRate is not supported! (${supportedSampleRates})")
+            else
+                tempSource.sampleRate = bestMatch
+        }
+
+        // Update UI for RTL-SDR gain steps (if this is the active device)
+        if (tempSource is RtlsdrSource && activeDeviceId == null) {
             val currentGainIndex = appStateRepository.rtlsdrGainIndex.value
             val currentIFGainIndex = appStateRepository.rtlsdrIFGainIndex.value
-            val gainIndexList = (source as RtlsdrSource).possibleGainValues.toList()
-            val ifGainIndexList = (source as RtlsdrSource).possibleIFGainValues.toList()
+            val gainIndexList = tempSource.possibleGainValues.toList()
+            val ifGainIndexList = tempSource.possibleIFGainValues.toList()
             appStateRepository.rtlsdrGainIndex.set(0)
             appStateRepository.rtlsdrIFGainIndex.set(0)
             appStateRepository.rtlsdrGainSteps.set(gainIndexList)
@@ -313,56 +429,91 @@ class AnalyzerService : Service() {
         }
 
         // Create a new instance of Scheduler
-        scheduler = Scheduler(appStateRepository.fftSize.value, source!!)
+        val newScheduler = Scheduler(appStateRepository.fftSize.value, tempSource)
 
         // Start the demodulator thread:
-        demodulator = Demodulator(
-            scheduler!!.demodOutputQueue,
-            scheduler!!.demodInputQueue,
-            source!!.packetSize / source!!.bytesPerSample
+        val newDemodulator = Demodulator(
+            newScheduler.demodOutputQueue,
+            newScheduler.demodInputQueue,
+            tempSource.packetSize / tempSource.bytesPerSample
         )
-        demodulator!!.audioVolumeLevel = appStateRepository.effectiveAudioVolumeLevel.value
-        demodulator!!.start()
-
-        applyNewDemodulationMode(appStateRepository.demodulationMode.value)
+        newDemodulator.audioVolumeLevel = appStateRepository.effectiveAudioVolumeLevel.value
+        newDemodulator.start()
 
         // Start the scheduler
-        scheduler!!.start()
+        newScheduler.start()
 
-        fftProcessor = FftProcessor(
+        val newFftProcessor = FftProcessor(
             initialFftSize = appStateRepository.fftSize.value,
-            inputQueue = scheduler!!.fftOutputQueue,  // Reference to the input queue for the processing loop
-            returnQueue = scheduler!!.fftInputQueue,  // Reference to the buffer-pool-return queue
+            inputQueue = newScheduler.fftOutputQueue,
+            returnQueue = newScheduler.fftInputQueue,
             fftProcessorData = appStateRepository.fftProcessorData,
             appStateRepository.waterfallSpeed.value,
             fftPeakHold = appStateRepository.fftPeakHold.value,
             getChannelFrequencyRange = {
-                val schedulerHandle = scheduler
-                val demodulatorHandle = demodulator
-                if(schedulerHandle != null && demodulatorHandle != null)
-                    Pair(
-                        schedulerHandle.channelFrequency - demodulatorHandle.channelWidth,
-                        schedulerHandle.channelFrequency + demodulatorHandle.channelWidth)
-                else
-                    null
+                val schedulerHandle = newScheduler
+                val demodulatorHandle = newDemodulator
+                Pair(
+                    schedulerHandle.channelFrequency - demodulatorHandle.channelWidth,
+                    schedulerHandle.channelFrequency + demodulatorHandle.channelWidth)
             },
             onAverageSignalStrengthChanged = appStateRepository.averageSignalStrength::set
         )
-        fftProcessor!!.start()
+        newFftProcessor.start()
 
-        // Set state to running and hand over fft processor queues to UI
-        appStateRepository.analyzerRunning.set(true)
-        appStateRepository.analyzerStartPending.set(false)
-        startForegroundService()
-        launchSupervisionCoroutine()
+        // Create pipeline and add to active pipelines
+        val pipeline = DevicePipeline(
+            id = deviceId,
+            sourceType = tempSources_types[deviceId]!!,
+            source = tempSource,
+            scheduler = newScheduler,
+            demodulator = newDemodulator,
+            fftProcessor = newFftProcessor
+        )
+        activePipelines[deviceId] = pipeline
 
-        // workaround for bug: when manual gain is enabled and the rtlsdr is started, the manual gain value is not accepted. so set it again here
-        if (source is RtlsdrSource && appStateRepository.rtlsdrManualGainEnabled.value) {
-            (source as RtlsdrSource).gain = appStateRepository.rtlsdrGainSteps.value[appStateRepository.rtlsdrGainIndex.value]
-            (source as RtlsdrSource).ifGain = appStateRepository.rtlsdrIFGainSteps.value[appStateRepository.rtlsdrIFGainIndex.value]
+        // Remove from temporary storage
+        tempSources.remove(deviceId)
+        tempSources_types.remove(deviceId)
+
+        // If this is the first device, make it active
+        if (activeDeviceId == null) {
+            activeDeviceId = deviceId
+            appStateRepository.sourceName.set(tempSource.name)
+            appStateRepository.sourceMinimumFrequency.set(tempSource.minFrequency)
+            appStateRepository.sourceMaximumFrequency.set(tempSource.maxFrequency)
+            appStateRepository.sourceSupportedSampleRates.set(supportedSampleRates.map { it.toLong() })
+            appStateRepository.sourceFrequency.set(tempSource.frequency)
+            appStateRepository.sourceSampleRate.set(tempSource.sampleRate.toLong())
+
+            applyNewDemodulationMode(appStateRepository.demodulationMode.value)
         }
 
+        // Set state to running on first device
+        if (activePipelines.size == 1) {
+            appStateRepository.analyzerRunning.set(true)
+            appStateRepository.analyzerStartPending.set(false)
+            startForegroundService()
+            launchSupervisionCoroutine()
+        }
+
+        // workaround for bug: when manual gain is enabled and the rtlsdr is started, the manual gain value is not accepted. so set it again here
+        if (tempSource is RtlsdrSource && appStateRepository.rtlsdrManualGainEnabled.value) {
+            tempSource.gain = appStateRepository.rtlsdrGainSteps.value[appStateRepository.rtlsdrGainIndex.value]
+            tempSource.ifGain = appStateRepository.rtlsdrIFGainSteps.value[appStateRepository.rtlsdrIFGainIndex.value]
+        }
+
+        Log.i(TAG, "startSchedulerForDevice: Device $deviceId started successfully. Total active devices: ${activePipelines.size}")
         return true
+    }
+
+    // Temporary storage for sources being initialized (before scheduler is started)
+    private val tempSources = mutableMapOf<String, IQSourceInterface>()
+    private val tempSources_types = mutableMapOf<String, SourceType>()
+
+    private fun startScheduler(): Boolean {
+        // Legacy method - delegates to active device
+        return activeDeviceId?.let { startSchedulerForDevice(it) } ?: false
     }
 
     private fun launchSupervisionCoroutine() {
@@ -412,16 +563,12 @@ class AnalyzerService : Service() {
     }
 
     /**
-     * Will create a IQ Source instance according to the user settings.
-     *
-     * @return true on success; false on error
+     * Create an IQ Source instance for a specific device type and ID
      */
-    private fun createSource(): Boolean {
-        when (appStateRepository.sourceType.value) {
-            SourceType.FILESOURCE -> source =
-                FileIQSource()
+    private fun createSourceForType(sourceType: SourceType, deviceId: String): IQSourceInterface? {
+        val newSource: IQSourceInterface = when (sourceType) {
+            SourceType.FILESOURCE -> FileIQSource()
             SourceType.HACKRF -> {
-                // Create HackrfSource
                 val hackrfSource = HackrfSource()
                 hackrfSource.setFrequency(appStateRepository.sourceFrequency.value)
                 hackrfSource.setSampleRate(appStateRepository.sourceSampleRate.value.toInt())
@@ -430,41 +577,36 @@ class AnalyzerService : Service() {
                 hackrfSource.setAmplifier(appStateRepository.hackrfAmplifierEnabled.value)
                 hackrfSource.setAntennaPower(appStateRepository.hackrfAntennaPowerEnabled.value)
                 hackrfSource.frequencyOffset = appStateRepository.hackrfConverterOffset.value.toInt()
-                source = hackrfSource
+                hackrfSource
             }
             SourceType.RTLSDR -> {
-                // Create RtlsdrSource
                 val rtlsdrSource = if(appStateRepository.rtlsdrExternalServerEnabled.value) {
                     RtlsdrSource(
                         appStateRepository.rtlsdrExternalServerIP.value,
                         appStateRepository.rtlsdrExternalServerPort.value
                     )
-                } else
-                    RtlsdrSource(
-                        "127.0.0.1",
-                        1234
-                    )
+                } else {
+                    RtlsdrSource("127.0.0.1", 1234)
+                }
                 rtlsdrSource.setAllowOutOfBoundFrequency(appStateRepository.rtlsdrAllowOutOfBoundFrequency.value || appStateRepository.rtlsdrBlogV4connected.value)
                 rtlsdrSource.setFrequency(appStateRepository.sourceFrequency.value)
                 rtlsdrSource.setSampleRate(appStateRepository.sourceSampleRate.value.toInt())
-
                 rtlsdrSource.frequencyCorrection = appStateRepository.rtlsdrFrequencyCorrection.value
                 rtlsdrSource.frequencyOffset = appStateRepository.rtlsdrConverterOffset.value.toInt()
                 rtlsdrSource.isAutomaticGainControl = appStateRepository.rtlsdrAgcEnabled.value
 
                 if (appStateRepository.rtlsdrManualGainEnabled.value) {
                     rtlsdrSource.isManualGain = true
-                    // note: there is a bug: when manual gain is enabled and the analyzer is started, the manual gain value set by the following statements is not accepted
-                    // therefore the gain is later set again at the end of startScheduler.
                     rtlsdrSource.gain = appStateRepository.rtlsdrGainSteps.value[appStateRepository.rtlsdrGainIndex.value]
                     rtlsdrSource.ifGain = appStateRepository.rtlsdrIFGainSteps.value[appStateRepository.rtlsdrIFGainIndex.value]
                 } else {
                     rtlsdrSource.isManualGain = false
                 }
-                source = rtlsdrSource
+                rtlsdrSource
             }
             SourceType.AIRSPY -> {
-                val airspySource = AirspySource()
+                val index = deviceId.split("_").lastOrNull()?.toIntOrNull() ?: 0
+                val airspySource = AirspySource(deviceIndex = index)
                 airspySource.frequency = appStateRepository.sourceFrequency.value
                 airspySource.sampleRate = appStateRepository.sourceSampleRate.value.toInt()
                 airspySource.lnaGain = appStateRepository.airspyLnaGain.value
@@ -475,7 +617,7 @@ class AnalyzerService : Service() {
                 airspySource.advancedGainEnabled = appStateRepository.airspyAdvancedGainEnabled.value
                 airspySource.rfBias = appStateRepository.airspyRfBiasEnabled.value
                 airspySource.frequencyOffset = appStateRepository.airspyConverterOffset.value.toInt()
-                source = airspySource
+                airspySource
             }
             SourceType.HYDRASDR -> {
                 val hydraSdrSource = HydraSdrSource()
@@ -490,22 +632,25 @@ class AnalyzerService : Service() {
                 hydraSdrSource.rfBias = appStateRepository.hydraSdrRfBiasEnabled.value
                 hydraSdrSource.rfPort = appStateRepository.hydraSdrRfPort.value
                 hydraSdrSource.frequencyOffset = appStateRepository.hydraSdrConverterOffset.value.toInt()
-                source = hydraSdrSource
+                hydraSdrSource
             }
         }
-        return true
+
+        // Store in temporary map
+        tempSources[deviceId] = newSource
+        tempSources_types[deviceId] = sourceType
+        return newSource
     }
 
     /**
-     * Will open the IQ Source instance.
-     * Note: some sources need special treatment on opening, like the rtl-sdr source.
-     *
-     * @return true on success; false on error
+     * Open the IQ Source for a specific device
      */
-    private fun openSource(): Boolean {
-        when (appStateRepository.sourceType.value) {
-            SourceType.FILESOURCE -> if (source != null && source is FileIQSource) {
-                (source as FileIQSource).init(
+    private fun openSourceForDevice(source: IQSourceInterface, deviceId: String, sourceType: SourceType): Boolean {
+        val callback = createIQSourceCallback(deviceId)
+
+        return when (sourceType) {
+            SourceType.FILESOURCE -> if (source is FileIQSource) {
+                source.init(
                     appStateRepository.filesourceUri.value.toUri(),
                     this.contentResolver,
                     appStateRepository.sourceSampleRate.value.toInt(),
@@ -519,49 +664,55 @@ class AnalyzerService : Service() {
                         FilesourceFileFormat.HYDRASDR -> FileIQSource.FILE_FORMAT_16BIT_SIGNED
                     }
                 )
-                return source?.open(this, iqSourceActions) == true
+                source.open(this, callback) == true
             } else {
-                Log.e(TAG,"openSource: sourceType is FILE_SOURCE, but source is null or of other type.")
-                return false
+                Log.e(TAG,"openSourceForDevice: sourceType is FILE_SOURCE, but source is of wrong type.")
+                false
             }
 
-            SourceType.HACKRF -> if (source != null && source is HackrfSource)
-                return source!!.open( this, iqSourceActions)
-            else {
-                Log.e(TAG, "openSource: sourceType is HACKRF_SOURCE, but source is null or of other type.")
-                return false
+            SourceType.HACKRF -> if (source is HackrfSource) {
+                source.open(this, callback)
+            } else {
+                Log.e(TAG, "openSourceForDevice: sourceType is HACKRF_SOURCE, but source is of wrong type.")
+                false
             }
 
-            SourceType.RTLSDR -> if (source != null && source is RtlsdrSource)
-                return source?.open(this, iqSourceActions) == true
-            else {
-                Log.e(TAG, "openSource: sourceType is RTLSDR_SOURCE, but source is null or of other type.")
-                return false
+            SourceType.RTLSDR -> if (source is RtlsdrSource) {
+                source.open(this, callback) == true
+            } else {
+                Log.e(TAG, "openSourceForDevice: sourceType is RTLSDR_SOURCE, but source is of wrong type.")
+                false
             }
 
-            SourceType.AIRSPY -> if (source != null && source is AirspySource)
-                return source?.open(this, iqSourceActions) == true
-            else {
-                Log.e(TAG, "openSource: sourceType is AIRSPY, but source is null or of other type.")
-                return false
+            SourceType.AIRSPY -> if (source is AirspySource) {
+                source.open(this, callback) == true
+            } else {
+                Log.e(TAG, "openSourceForDevice: sourceType is AIRSPY, but source is of wrong type.")
+                false
             }
 
-            SourceType.HYDRASDR -> if (source != null && source is HydraSdrSource)
-                return source?.open(this, iqSourceActions) == true
-            else {
-                Log.e(TAG, "openSource: sourceType is HYDRASDR, but source is null or of other type.")
-                return false
+            SourceType.HYDRASDR -> if (source is HydraSdrSource) {
+                source.open(this, callback) == true
+            } else {
+                Log.e(TAG, "openSourceForDevice: sourceType is HYDRASDR, but source is of wrong type.")
+                false
             }
         }
     }
 
-    fun startRecording() {
-        if (appStateRepository.recordingRunning.value) {
-            Log.w(TAG, "startRecording: Recording is already running. do nothing..")
+    // Legacy createSource() and openSource() methods removed - now use createSourceForType() and openSourceForDevice()
+
+    /**
+     * Start recording for a specific device
+     */
+    fun startRecordingForDevice(deviceId: String) {
+        val pipeline = activePipelines[deviceId] ?: run {
+            Log.w(TAG, "startRecordingForDevice: Device $deviceId not found")
             return
         }
+
         val recordingStartedTimestamp = System.currentTimeMillis()
-        val filename = "ongoing_recording.iq"
+        val filename = "${deviceId}_ongoing_recording.iq"
 
         // Check if user has selected custom directory via SAF
         val customDirUriStr = appStateRepository.recordingDirectoryUri.value
@@ -639,21 +790,72 @@ class AnalyzerService : Service() {
             StopAfterUnit.SEC -> maxRecordingTimeMilliseconds = appStateRepository.recordingStopAfterThreshold.value*1000L
             StopAfterUnit.MIN -> maxRecordingTimeMilliseconds = appStateRepository.recordingStopAfterThreshold.value*1000L*60L
         }
-        scheduler?.startRecording(
+        pipeline.scheduler.startRecording(
             bufferedOutputStream = bufferedOutputStream,
             onlyWhenSquelchIsSatisfied = appStateRepository.recordOnlyWhenSquelchIsSatisfied.value,
             maxRecordingTime = maxRecordingTimeMilliseconds,
             maxRecordingFileSize = maxRecordingFileSizeBytes,
-            onRecordingStopped = { finalSize -> appStateRepository.emitAnalyzerEvent(AppStateRepository.AnalyzerEvent.RecordingFinished(finalSize, fileRef)) },
+            onRecordingStopped = { finalSize ->
+                appStateRepository.emitAnalyzerEvent(AppStateRepository.AnalyzerEvent.RecordingFinished(finalSize, fileRef))
+                // Check if all devices stopped recording
+                if (activePipelines.values.none { it.scheduler.isRecording }) {
+                    appStateRepository.recordingRunning.set(false)
+                }
+            },
             onFileSizeUpdate = appStateRepository.recordingCurrentFileSize::set
         )
+
+        Log.i(TAG, "startRecordingForDevice: Started recording for device $deviceId")
+    }
+
+    /**
+     * Start recording for all active devices
+     */
+    fun startRecording() {
+        if (appStateRepository.recordingRunning.value) {
+            Log.w(TAG, "startRecording: Recording is already running. do nothing..")
+            return
+        }
+
+        if (activePipelines.isEmpty()) {
+            Log.w(TAG, "startRecording: No active devices to record from")
+            return
+        }
+
+        Log.i(TAG, "startRecording: Starting recording for ${activePipelines.size} devices")
+
+        // Start recording for all active devices
+        activePipelines.keys.forEach { deviceId ->
+            startRecordingForDevice(deviceId)
+        }
+
         // update ui
-        appStateRepository.recordingStartedTimestamp.set(recordingStartedTimestamp)
+        appStateRepository.recordingStartedTimestamp.set(System.currentTimeMillis())
         appStateRepository.recordingRunning.set(true)
     }
 
+    /**
+     * Stop recording for a specific device
+     */
+    fun stopRecordingForDevice(deviceId: String) {
+        val pipeline = activePipelines[deviceId] ?: run {
+            Log.w(TAG, "stopRecordingForDevice: Device $deviceId not found")
+            return
+        }
+
+        pipeline.scheduler.stopRecording()
+        Log.i(TAG, "stopRecordingForDevice: Stopped recording for device $deviceId")
+    }
+
+    /**
+     * Stop recording for all devices
+     */
     fun stopRecording() {
-        scheduler?.stopRecording()
+        Log.i(TAG, "stopRecording: Stopping recording for all devices")
+        activePipelines.keys.forEach { deviceId ->
+            stopRecordingForDevice(deviceId)
+        }
+        appStateRepository.recordingRunning.set(false)
     }
 
     private fun handleAppStateChanges() {
