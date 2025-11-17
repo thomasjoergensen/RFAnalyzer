@@ -67,6 +67,7 @@ import com.mantz_it.rfanalyzer.R
 import com.mantz_it.rfanalyzer.analyzer.AnalyzerService
 import com.mantz_it.rfanalyzer.database.AppStateRepository
 import com.mantz_it.rfanalyzer.database.BillingRepositoryInterface
+import com.mantz_it.rfanalyzer.database.IEMDao
 import com.mantz_it.rfanalyzer.database.collectAppState
 import com.mantz_it.rfanalyzer.ui.MainViewModel.UiAction
 import com.mantz_it.rfanalyzer.ui.composable.LocalShowHelp
@@ -124,6 +125,7 @@ class MainActivity: ComponentActivity() {
 
     @Inject lateinit var appStateRepository: AppStateRepository
     @Inject lateinit var billingRepository: BillingRepositoryInterface
+    @Inject lateinit var iemDao: IEMDao
     private val mainViewModel: MainViewModel by viewModels()
     private var analyzerService: AnalyzerService? = null
     private var isBound = false
@@ -390,7 +392,7 @@ class MainActivity: ComponentActivity() {
                                     appStateRepository.welcomeScreenFinished.set(true)
                                     mainViewModel.navigate(AppScreen.MainScreen)
                                 }) }
-                                composable(AppScreen.MainScreen.route) { MainScreen(analyzerSurface, mainViewModel, appStateRepository, billingRepository) }
+                                composable(AppScreen.MainScreen.route) { MainScreen(analyzerSurface, mainViewModel, appStateRepository, billingRepository, iemDao) }
                                 composable(AppScreen.RecordingScreen.route) { RecordingsScreen(navController, mainViewModel.recordings, appStateRepository.displayOnlyFavoriteRecordings.stateFlow, mainViewModel.recordingsScreenActions) }
                                 composable(AppScreen.LogFileScreen.route) { LogFileScreen(navController, mainViewModel.logContent) }
                                 composable(AppScreen.AboutScreen.route) { AboutScreen(versionName, navController) }

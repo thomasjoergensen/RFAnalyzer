@@ -16,6 +16,10 @@ import com.mantz_it.rfanalyzer.database.BillingRepositoryInterface
 import com.mantz_it.rfanalyzer.database.DiscoveredSignal
 import com.mantz_it.rfanalyzer.database.Recording
 import com.mantz_it.rfanalyzer.database.RecordingDao
+import com.mantz_it.rfanalyzer.database.IEMDao
+import com.mantz_it.rfanalyzer.database.IEMDetectedChannel
+import com.mantz_it.rfanalyzer.database.IEMDetectedChannelInfo
+import com.mantz_it.rfanalyzer.database.IEMScanResult
 import com.mantz_it.rfanalyzer.database.ScanDao
 import com.mantz_it.rfanalyzer.database.ScanResult
 import com.mantz_it.rfanalyzer.database.calculateFileName
@@ -30,6 +34,7 @@ import com.mantz_it.rfanalyzer.ui.composable.DisplayTabActions
 import com.mantz_it.rfanalyzer.ui.composable.FilesourceFileFormat
 import com.mantz_it.rfanalyzer.ui.composable.RecordingTabActions
 import com.mantz_it.rfanalyzer.ui.composable.ScanDetectionMode
+import com.mantz_it.rfanalyzer.ui.composable.IEMPresetsTabActions
 import com.mantz_it.rfanalyzer.ui.composable.ScanTabActions
 import com.mantz_it.rfanalyzer.ui.composable.SettingsTabActions
 import com.mantz_it.rfanalyzer.ui.composable.SourceTabActions
@@ -99,6 +104,7 @@ class MainViewModel @Inject constructor(
     private val appStateRepository: AppStateRepository,
     private val recordingDao:RecordingDao,
     private val scanDao: ScanDao,
+    private val iemDao: IEMDao,
     private val billingRepository: BillingRepositoryInterface
 ) : ViewModel() {
     companion object {
@@ -503,6 +509,304 @@ class MainViewModel @Inject constructor(
             appStateRepository.discoveredSignals.set(currentSignals.filter { it.frequency != signal.frequency })
         }
     )
+
+    // IEM Presets Tab
+    private var iemScanJob: kotlinx.coroutines.Job? = null
+
+    val iemPresetsTabActions = IEMPresetsTabActions(
+        onPresetSelectionChanged = { presetId, selected ->
+            val currentSelection = appStateRepository.iemSelectedPresetIds.value.toMutableSet()
+            if (selected) {
+                currentSelection.add(presetId)
+            } else {
+                currentSelection.remove(presetId)
+            }
+            appStateRepository.iemSelectedPresetIds.set(currentSelection)
+        },
+        onStartScanClicked = { startIEMScanning() },
+        onStopScanClicked = { stopIEMScanning() },
+        onClearResultsClicked = {
+            appStateRepository.iemDetectedChannels.set(emptyList())
+            appStateRepository.iemCurrentScanResultId.set(null)
+        },
+        onTuneToChannel = { frequency ->
+            if (!appStateRepository.iemScanRunning.value) {
+                appStateRepository.sourceFrequency.set(frequency)
+                appStateRepository.channelFrequency.set(frequency)
+            }
+        },
+        onRecordChannel = { frequency ->
+            if (!appStateRepository.iemScanRunning.value && !appStateRepository.recordingRunning.value) {
+                // Tune to the frequency first
+                appStateRepository.sourceFrequency.set(frequency)
+                appStateRepository.channelFrequency.set(frequency)
+                // Start recording
+                sendActionToUi(UiAction.OnStartRecordingClicked)
+            }
+        },
+        onRemoveDetection = { detection ->
+            val currentDetections = appStateRepository.iemDetectedChannels.value
+            appStateRepository.iemDetectedChannels.set(currentDetections.filter {
+                it.detectedChannel.id != detection.detectedChannel.id
+            })
+        },
+        onDetectionThresholdChanged = appStateRepository.iemDetectionThreshold::set,
+        onNoiseFloorMarginChanged = appStateRepository.iemNoiseFloorMargin::set,
+        onUseNoiseFloorChanged = appStateRepository.iemUseNoiseFloor::set
+    )
+
+    private fun startIEMScanning() {
+        // Validate preconditions
+        if (!appStateRepository.analyzerRunning.value) {
+            showSnackbar(SnackbarEvent("Analyzer must be running to scan IEM presets"))
+            return
+        }
+        if (appStateRepository.recordingRunning.value) {
+            showSnackbar(SnackbarEvent("Cannot scan while recording is active"))
+            return
+        }
+        if (appStateRepository.iemSelectedPresetIds.value.isEmpty()) {
+            showSnackbar(SnackbarEvent("Please select at least one IEM preset to scan"))
+            return
+        }
+
+        // Start IEM scanning
+        appStateRepository.iemScanRunning.set(true)
+        appStateRepository.iemScanProgress.set(0f)
+        appStateRepository.iemDetectedChannels.set(emptyList())
+
+        val selectedPresetIds = appStateRepository.iemSelectedPresetIds.value.toList()
+        val dwellTime = 300L // Fixed 300ms dwell time for IEM scanning (IEM signals are continuous)
+        val useNoiseFloor = appStateRepository.iemUseNoiseFloor.value
+        val fixedThreshold = appStateRepository.iemDetectionThreshold.value
+        val noiseFloorMargin = appStateRepository.iemNoiseFloorMargin.value
+
+        iemScanJob = viewModelScope.launch {
+            val scanStartTime = System.currentTimeMillis()
+            val detectedChannels = mutableListOf<IEMDetectedChannel>()
+
+            try {
+                // Step 1: Query database for all channels in selected presets
+                val channels = withContext(Dispatchers.IO) {
+                    iemDao.getChannelsForPresets(selectedPresetIds)
+                }
+
+                if (channels.isEmpty()) {
+                    showSnackbar(SnackbarEvent("No channels found in selected presets"))
+                    return@launch
+                }
+
+                Log.d(TAG, "IEM Scan: Found ${channels.size} channels to scan")
+
+                // Step 2: Get current sample rate and calculate usable bandwidth
+                val sampleRate = appStateRepository.sourceSampleRate.value
+                val usableBandwidth = (sampleRate * 0.8).toLong()
+
+                Log.d(TAG, "IEM Scan: sampleRate=$sampleRate, usableBandwidth=$usableBandwidth")
+
+                // Step 2.5: Estimate noise floor if enabled
+                var noiseFloor = -80f // Default fallback
+                if (useNoiseFloor) {
+                    val noiseFloorSamples = mutableListOf<Float>()
+                    // Sample 3 random frequencies from the channels list
+                    val sampleIndices = if (channels.size <= 3) {
+                        channels.indices.toList()
+                    } else {
+                        listOf(0, channels.size / 2, channels.size - 1)
+                    }
+
+                    for (i in sampleIndices) {
+                        appStateRepository.sourceFrequency.set(channels[i].frequency)
+                        delay(dwellTime)
+                        val avgLevel = getAverageSignalLevel()
+                        if (avgLevel != null) noiseFloorSamples.add(avgLevel)
+                    }
+
+                    noiseFloor = if (noiseFloorSamples.isNotEmpty()) {
+                        noiseFloorSamples.average().toFloat()
+                    } else {
+                        -80f
+                    }
+                    appStateRepository.noiseFloorLevel.set(noiseFloor)
+                    Log.d(TAG, "IEM Scan: Estimated noise floor: $noiseFloor dB, margin: $noiseFloorMargin dB")
+                }
+
+                // Step 3: Group channels by frequency proximity (batch channels within same FFT window)
+                val sortedChannels = channels.sortedBy { it.frequency }
+                val channelBatches = mutableListOf<List<com.mantz_it.rfanalyzer.database.IEMChannel>>()
+                var currentBatch = mutableListOf<com.mantz_it.rfanalyzer.database.IEMChannel>()
+
+                for (channel in sortedChannels) {
+                    if (currentBatch.isEmpty()) {
+                        currentBatch.add(channel)
+                    } else {
+                        val batchCenterFreq = (currentBatch.first().frequency + currentBatch.last().frequency) / 2
+                        val freqDiff = kotlin.math.abs(channel.frequency - batchCenterFreq)
+
+                        // Can we fit this channel in current batch's FFT window?
+                        if (freqDiff < usableBandwidth / 2) {
+                            currentBatch.add(channel)
+                        } else {
+                            // Start new batch
+                            channelBatches.add(currentBatch)
+                            currentBatch = mutableListOf(channel)
+                        }
+                    }
+                }
+                if (currentBatch.isNotEmpty()) {
+                    channelBatches.add(currentBatch)
+                }
+
+                Log.d(TAG, "IEM Scan: Grouped ${channels.size} channels into ${channelBatches.size} batches")
+
+                // Step 4: Scan each batch
+                var scannedChannels = 0
+                for ((batchIndex, batch) in channelBatches.withIndex()) {
+                    if (!appStateRepository.iemScanRunning.value) break
+
+                    // Calculate center frequency for this batch
+                    val batchCenterFreq = (batch.first().frequency + batch.last().frequency) / 2
+
+                    // Tune to batch center frequency
+                    appStateRepository.sourceFrequency.set(batchCenterFreq)
+                    appStateRepository.iemCurrentScanFrequency.set(batchCenterFreq)
+
+                    // Wait for FFT to settle
+                    delay(dwellTime)
+
+                    // Step 5: Analyze each channel in this batch
+                    val effectiveThreshold = if (useNoiseFloor) {
+                        noiseFloor + noiseFloorMargin
+                    } else {
+                        fixedThreshold
+                    }
+                    val batchDetections = detectIEMChannelsInFFT(batch, batchCenterFreq, sampleRate, effectiveThreshold)
+                    detectedChannels.addAll(batchDetections)
+
+                    // Update progress
+                    scannedChannels += batch.size
+                    val progress = scannedChannels.toFloat() / channels.size
+                    appStateRepository.iemScanProgress.set(progress)
+
+                    Log.d(TAG, "IEM Scan: Batch ${batchIndex + 1}/${channelBatches.size} - Found ${batchDetections.size} active channels")
+                }
+
+                // Step 6: Save results to database and update UI
+                if (detectedChannels.isNotEmpty()) {
+                    val scanDuration = System.currentTimeMillis() - scanStartTime
+                    val avgStrength = detectedChannels.map { it.averageStrength }.average().toFloat()
+
+                    withContext(Dispatchers.IO) {
+                        val scanResult = IEMScanResult(
+                            timestamp = scanStartTime,
+                            scanDuration = scanDuration,
+                            scannedPresetIds = selectedPresetIds.joinToString(","),
+                            detectedCount = detectedChannels.size,
+                            averageSignalStrength = avgStrength
+                        )
+                        val scanResultId = iemDao.saveScanWithDetections(scanResult, detectedChannels)
+                        appStateRepository.iemCurrentScanResultId.set(scanResultId)
+
+                        // Load full channel info for UI
+                        val channelInfo = iemDao.getDetectedChannelInfoForScan(scanResultId)
+                        appStateRepository.iemDetectedChannels.set(channelInfo)
+                    }
+
+                    showSnackbar(SnackbarEvent("IEM scan complete. Found ${detectedChannels.size} active channels."))
+                } else {
+                    showSnackbar(SnackbarEvent("IEM scan complete. No active channels detected."))
+                }
+
+            } catch (e: Exception) {
+                Log.e(TAG, "Error during IEM scanning", e)
+                showSnackbar(SnackbarEvent("IEM scan failed: ${e.message}"))
+            } finally {
+                appStateRepository.iemScanRunning.set(false)
+            }
+        }
+    }
+
+    private fun stopIEMScanning() {
+        iemScanJob?.cancel()
+        appStateRepository.iemScanRunning.set(false)
+        showSnackbar(SnackbarEvent("IEM scan stopped"))
+    }
+
+    /**
+     * Analyzes FFT data for specific IEM channel frequencies
+     * Uses configurable threshold (fixed or noise floor + margin)
+     */
+    private fun detectIEMChannelsInFFT(
+        channels: List<com.mantz_it.rfanalyzer.database.IEMChannel>,
+        centerFrequency: Long,
+        sampleRate: Long,
+        threshold: Float
+    ): List<IEMDetectedChannel> {
+        val fftProcessorData = appStateRepository.fftProcessorData
+        val detectedChannels = mutableListOf<IEMDetectedChannel>()
+
+        try {
+            fftProcessorData.lock.readLock().lock()
+            try {
+                val waterfallBuffer = fftProcessorData.waterfallBuffer ?: return emptyList()
+                if (waterfallBuffer.isEmpty()) return emptyList()
+
+                val readIndex = fftProcessorData.readIndex
+                if (readIndex < 0 || readIndex >= waterfallBuffer.size) return emptyList()
+
+                val currentFFT = waterfallBuffer[readIndex]
+                if (currentFFT.isEmpty()) return emptyList()
+
+                // Calculate FFT parameters
+                val fftSize = currentFFT.size
+                val frequencyResolution = sampleRate.toFloat() / fftSize
+                val startFrequency = centerFrequency - sampleRate / 2
+
+                // Check each channel frequency
+                for (channel in channels) {
+                    // Calculate FFT bin index for this channel frequency
+                    val binIndex = ((channel.frequency - startFrequency) / frequencyResolution).toInt()
+
+                    if (binIndex in currentFFT.indices) {
+                        // Analyze window around the channel (±100 kHz for 200 kHz IEM bandwidth)
+                        // With typical 2.5 MHz sample rate, this is about ±40 bins
+                        val windowHalfSize = (100000 / frequencyResolution).toInt().coerceAtLeast(5)
+                        val windowStart = (binIndex - windowHalfSize).coerceAtLeast(0)
+                        val windowEnd = (binIndex + windowHalfSize).coerceAtMost(currentFFT.size - 1)
+
+                        val windowData = currentFFT.sliceArray(windowStart..windowEnd)
+                        val peakSignal = windowData.maxOrNull() ?: continue
+                        val avgSignal = windowData.average().toFloat()
+
+                        // Detect if signal is above threshold
+                        // Use peak detection since IEM signals have strong carriers
+                        if (peakSignal > threshold) {
+                            detectedChannels.add(
+                                IEMDetectedChannel(
+                                    id = 0,
+                                    scanResultId = 0, // Will be set when saving to DB
+                                    channelId = channel.id,
+                                    peakStrength = peakSignal,
+                                    averageStrength = avgSignal,
+                                    detectionConfidence = 1.0f
+                                )
+                            )
+
+                            Log.d(TAG, "IEM detected: ${channel.frequency.asStringWithUnit("Hz")} - " +
+                                    "peak=${peakSignal.toInt()}dB, avg=${avgSignal.toInt()}dB")
+                        }
+                    }
+                }
+
+            } finally {
+                fftProcessorData.lock.readLock().unlock()
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error detecting IEM channels in FFT", e)
+        }
+
+        return detectedChannels
+    }
 
     private fun startScanning() {
         // Validate preconditions

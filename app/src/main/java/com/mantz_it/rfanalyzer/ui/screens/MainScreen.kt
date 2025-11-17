@@ -15,6 +15,7 @@ import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.viewinterop.AndroidView
 import com.mantz_it.rfanalyzer.database.AppStateRepository
 import com.mantz_it.rfanalyzer.database.BillingRepositoryInterface
+import com.mantz_it.rfanalyzer.database.IEMDao
 import com.mantz_it.rfanalyzer.ui.AnalyzerSurface
 import com.mantz_it.rfanalyzer.ui.MainViewModel
 import com.mantz_it.rfanalyzer.ui.composable.AnalyzerTabsComposable
@@ -51,11 +52,12 @@ import com.mantz_it.rfanalyzer.ui.composable.DrawerSide
 
 
 @Composable
-fun MainScreen(analyzerSurface: AnalyzerSurface, viewModel: MainViewModel, appStateRepository: AppStateRepository, billingRepository: BillingRepositoryInterface) {
+fun MainScreen(analyzerSurface: AnalyzerSurface, viewModel: MainViewModel, appStateRepository: AppStateRepository, billingRepository: BillingRepositoryInterface, iemDao: IEMDao) {
     val configuration = LocalConfiguration.current
     val isLandscape = configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
     val isDrawerOpen = rememberSaveable { mutableStateOf(true) }
     val controlDrawerSide by appStateRepository.controlDrawerSide.stateFlow.collectAsState()
+    val availableIEMPresets by iemDao.getAllEnabledPresets().collectAsState(initial = emptyList())
 
     CustomSideDrawerOverlay(
         drawerSide = if(isLandscape) {
@@ -86,6 +88,8 @@ fun MainScreen(analyzerSurface: AnalyzerSurface, viewModel: MainViewModel, appSt
             demodulationTabActions = viewModel.demodulationTabActions,
             recordingTabActions = viewModel.recordingTabActions,
             scanTabActions = viewModel.scanTabActions,
+            iemPresetsTabActions = viewModel.iemPresetsTabActions,
+            availableIEMPresets = availableIEMPresets,
             settingsTabActions = viewModel.settingsTabActions,
             aboutTabActions = viewModel.aboutTabActions,
         ) },

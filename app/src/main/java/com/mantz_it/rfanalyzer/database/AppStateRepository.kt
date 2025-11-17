@@ -267,6 +267,18 @@ class AppStateRepository @Inject constructor(
     val longPressHelpEnabled = Setting("longPressHelpEnabled", true, scope, dataStore)
     val reverseTuningWheel = Setting("reverseTuningWheel", false, scope, dataStore)
 
+    // IEM Presets
+    val iemPresetsPopulated = Setting("iemPresetsPopulated", false, scope, dataStore)
+    val iemSelectedPresetIds = MutableState<Set<Long>>(emptySet()) // Selected presets for scanning
+    val iemDetectionThreshold = Setting("iemDetectionThreshold", -40f, scope, dataStore) // Configurable threshold in dB
+    val iemNoiseFloorMargin = Setting("iemNoiseFloorMargin", 15f, scope, dataStore) // Margin above noise floor
+    val iemUseNoiseFloor = Setting("iemUseNoiseFloor", true, scope, dataStore) // Use noise floor estimation vs fixed threshold
+    val iemScanRunning = MutableState(false)
+    val iemScanProgress = MutableState(0f) // 0.0 to 1.0
+    val iemCurrentScanFrequency = MutableState(0L)
+    val iemDetectedChannels = MutableState<List<IEMDetectedChannelInfo>>(emptyList())
+    val iemCurrentScanResultId = MutableState<Long?>(null) // ID of the current scan result in database
+
     // Recordings Screen
     val displayOnlyFavoriteRecordings = Setting("displayOnlyFavoriteRecordings", false, scope, dataStore)
 

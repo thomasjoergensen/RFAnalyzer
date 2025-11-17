@@ -17,6 +17,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import com.mantz_it.rfanalyzer.database.AppStateRepository
 import com.mantz_it.rfanalyzer.database.BillingRepositoryInterface
+import com.mantz_it.rfanalyzer.database.IEMPreset
 import com.mantz_it.rfanalyzer.ui.MainViewModel
 
 /**
@@ -51,6 +52,7 @@ enum class AnalyzerTabs(val displayName: String) {
     DEMODULATION("Demodulation"),
     RECORDING("Recording"),
     SCAN("Scan"),
+    IEM_PRESETS("IEM Presets"),
     DISPLAY("Display"),
     SETTINGS("Settings"),
     ABOUT("About")
@@ -67,6 +69,8 @@ fun AnalyzerTabsComposable(
     demodulationTabActions: DemodulationTabActions,
     recordingTabActions: RecordingTabActions,
     scanTabActions: ScanTabActions,
+    iemPresetsTabActions: IEMPresetsTabActions,
+    availableIEMPresets: List<IEMPreset>,
     settingsTabActions: SettingsTabActions,
     aboutTabActions: AboutTabActions,
 ) {
@@ -160,6 +164,14 @@ fun AnalyzerTabsComposable(
     val scanMinimumGap by appStateRepository.scanMinimumGap.stateFlow.collectAsState()
     val discoveredSignals by appStateRepository.discoveredSignals.stateFlow.collectAsState()
     val noiseFloorLevel by appStateRepository.noiseFloorLevel.stateFlow.collectAsState()
+    val iemSelectedPresetIds by appStateRepository.iemSelectedPresetIds.stateFlow.collectAsState()
+    val iemScanRunning by appStateRepository.iemScanRunning.stateFlow.collectAsState()
+    val iemScanProgress by appStateRepository.iemScanProgress.stateFlow.collectAsState()
+    val iemCurrentScanFrequency by appStateRepository.iemCurrentScanFrequency.stateFlow.collectAsState()
+    val iemDetectedChannels by appStateRepository.iemDetectedChannels.stateFlow.collectAsState()
+    val iemDetectionThreshold by appStateRepository.iemDetectionThreshold.stateFlow.collectAsState()
+    val iemNoiseFloorMargin by appStateRepository.iemNoiseFloorMargin.stateFlow.collectAsState()
+    val iemUseNoiseFloor by appStateRepository.iemUseNoiseFloor.stateFlow.collectAsState()
     val screenOrientation by appStateRepository.screenOrientation.stateFlow.collectAsState()
     val fontSize by appStateRepository.fontSize.stateFlow.collectAsState()
     val colorTheme by appStateRepository.colorTheme.stateFlow.collectAsState()
@@ -315,6 +327,21 @@ fun AnalyzerTabsComposable(
                         noiseFloor = noiseFloorLevel,
                         discoveredSignals = discoveredSignals,
                         scanTabActions = scanTabActions
+                    )
+                AnalyzerTabs.IEM_PRESETS
+                    -> IEMPresetsTabComposable(
+                        analyzerRunning = analyzerRunning,
+                        recordingRunning = recordingRunning,
+                        iemScanRunning = iemScanRunning,
+                        availablePresets = availableIEMPresets,
+                        selectedPresetIds = iemSelectedPresetIds,
+                        detectedChannels = iemDetectedChannels,
+                        scanProgress = iemScanProgress,
+                        currentFrequency = iemCurrentScanFrequency,
+                        detectionThreshold = iemDetectionThreshold,
+                        noiseFloorMargin = iemNoiseFloorMargin,
+                        useNoiseFloor = iemUseNoiseFloor,
+                        iemPresetsTabActions = iemPresetsTabActions
                     )
                 AnalyzerTabs.SETTINGS
                     -> SettingsTabComposable(

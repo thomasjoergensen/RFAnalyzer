@@ -9,8 +9,10 @@ import com.mantz_it.rfanalyzer.database.AppDatabase
 import com.mantz_it.rfanalyzer.database.AppStateRepository
 import com.mantz_it.rfanalyzer.database.BillingRepository
 import com.mantz_it.rfanalyzer.database.BillingRepositoryInterface
+import com.mantz_it.rfanalyzer.database.IEMDao
 import com.mantz_it.rfanalyzer.database.MIGRATION_1_2
 import com.mantz_it.rfanalyzer.database.MIGRATION_2_3
+import com.mantz_it.rfanalyzer.database.MIGRATION_3_4
 import com.mantz_it.rfanalyzer.database.MockedBillingRepository
 import com.mantz_it.rfanalyzer.database.RecordingDao
 import com.mantz_it.rfanalyzer.database.ScanDao
@@ -61,7 +63,7 @@ object AppModule {
             context,
             AppDatabase::class.java,
             "recordings_db"
-        ).addMigrations(MIGRATION_1_2, MIGRATION_2_3)
+        ).addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
             .build()
     }
 
@@ -73,6 +75,11 @@ object AppModule {
     @Provides
     fun provideScanDao(db: AppDatabase): ScanDao {
         return db.scanDao()
+    }
+
+    @Provides
+    fun provideIEMDao(db: AppDatabase): IEMDao {
+        return db.iemDao()
     }
 
     @Provides

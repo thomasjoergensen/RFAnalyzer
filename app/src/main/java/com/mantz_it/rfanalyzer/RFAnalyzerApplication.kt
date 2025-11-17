@@ -3,7 +3,15 @@ package com.mantz_it.rfanalyzer
 import android.app.Application
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.util.Log
+import com.mantz_it.rfanalyzer.database.AppStateRepository
+import com.mantz_it.rfanalyzer.database.IEMPresetPopulator
 import dagger.hilt.android.HiltAndroidApp
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
+import javax.inject.Inject
 
 /**
  * <h1>RF Analyzer - Application Class</h1>
@@ -34,9 +42,46 @@ import dagger.hilt.android.HiltAndroidApp
 
 @HiltAndroidApp
 class RFAnalyzerApplication : Application() {
+    @Inject
+    lateinit var iemPresetPopulator: IEMPresetPopulator
+
+    @Inject
+    lateinit var appStateRepository: AppStateRepository
+
+    private val applicationScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    companion object {
+        private const val TAG = "RFAnalyzerApplication"
+    }
+
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
+        initializeIEMPresets()
+    }
+
+    /**
+     * Populate IEM presets database on first app launch
+     */
+    private fun initializeIEMPresets() {
+        applicationScope.launch {
+            try {
+                // Wait for settings to load first
+                appStateRepository.blockUntilAllSettingsLoaded()
+
+                // Check if already populated
+                if (!appStateRepository.iemPresetsPopulated.value) {
+                    Log.i(TAG, "First launch detected - populating IEM presets database...")
+                    iemPresetPopulator.populateIfEmpty()
+                    appStateRepository.iemPresetsPopulated.set(true)
+                    Log.i(TAG, "IEM presets database initialized successfully")
+                } else {
+                    Log.d(TAG, "IEM presets already populated, skipping initialization")
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Error initializing IEM presets: ${e.message}", e)
+            }
+        }
     }
 
     private fun createNotificationChannel() {
