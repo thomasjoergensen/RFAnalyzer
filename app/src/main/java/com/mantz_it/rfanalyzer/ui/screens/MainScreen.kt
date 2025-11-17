@@ -85,6 +85,7 @@ fun MainScreen(analyzerSurface: AnalyzerSurface, viewModel: MainViewModel, appSt
             displayTabActions = viewModel.displayTabActions,
             demodulationTabActions = viewModel.demodulationTabActions,
             recordingTabActions = viewModel.recordingTabActions,
+            scanTabActions = viewModel.scanTabActions,
             settingsTabActions = viewModel.settingsTabActions,
             aboutTabActions = viewModel.aboutTabActions,
         ) },

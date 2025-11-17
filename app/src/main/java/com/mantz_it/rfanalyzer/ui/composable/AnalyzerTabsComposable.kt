@@ -50,6 +50,7 @@ enum class AnalyzerTabs(val displayName: String) {
     SOURCE("Source"),
     DEMODULATION("Demodulation"),
     RECORDING("Recording"),
+    SCAN("Scan"),
     DISPLAY("Display"),
     SETTINGS("Settings"),
     ABOUT("About")
@@ -65,6 +66,7 @@ fun AnalyzerTabsComposable(
     displayTabActions: DisplayTabActions,
     demodulationTabActions: DemodulationTabActions,
     recordingTabActions: RecordingTabActions,
+    scanTabActions: ScanTabActions,
     settingsTabActions: SettingsTabActions,
     aboutTabActions: AboutTabActions,
 ) {
@@ -144,6 +146,20 @@ fun AnalyzerTabsComposable(
     val recordingCurrentFileSize by appStateRepository.recordingCurrentFileSize.stateFlow.collectAsState()
     val recordingStartedTimestamp by appStateRepository.recordingStartedTimestamp.stateFlow.collectAsState()
     val recordingDirectoryUri by appStateRepository.recordingDirectoryUri.stateFlow.collectAsState()
+    val scanRunning by appStateRepository.scanRunning.stateFlow.collectAsState()
+    val scanProgress by appStateRepository.scanProgress.stateFlow.collectAsState()
+    val currentScanFrequency by appStateRepository.currentScanFrequency.stateFlow.collectAsState()
+    val scanStartFrequency by appStateRepository.scanStartFrequency.stateFlow.collectAsState()
+    val scanEndFrequency by appStateRepository.scanEndFrequency.stateFlow.collectAsState()
+    val scanThreshold by appStateRepository.scanThreshold.stateFlow.collectAsState()
+    val scanStepSize by appStateRepository.scanStepSize.stateFlow.collectAsState()
+    val scanDwellTime by appStateRepository.scanDwellTime.stateFlow.collectAsState()
+    val scanDetectionMode by appStateRepository.scanDetectionMode.stateFlow.collectAsState()
+    val scanNoiseFloorMargin by appStateRepository.scanNoiseFloorMargin.stateFlow.collectAsState()
+    val scanEnableSignalGrouping by appStateRepository.scanEnableSignalGrouping.stateFlow.collectAsState()
+    val scanMinimumGap by appStateRepository.scanMinimumGap.stateFlow.collectAsState()
+    val discoveredSignals by appStateRepository.discoveredSignals.stateFlow.collectAsState()
+    val noiseFloorLevel by appStateRepository.noiseFloorLevel.stateFlow.collectAsState()
     val screenOrientation by appStateRepository.screenOrientation.stateFlow.collectAsState()
     val fontSize by appStateRepository.fontSize.stateFlow.collectAsState()
     val colorTheme by appStateRepository.colorTheme.stateFlow.collectAsState()
@@ -279,6 +295,26 @@ fun AnalyzerTabsComposable(
                         recordingStartedTimestamp = recordingStartedTimestamp,
                         recordingDirectoryUri = recordingDirectoryUri,
                         recordingTabActions = recordingTabActions
+                    )
+                AnalyzerTabs.SCAN
+                    -> ScanTabComposable(
+                        analyzerRunning = analyzerRunning,
+                        recordingRunning = recordingRunning,
+                        scanRunning = scanRunning,
+                        scanProgress = scanProgress,
+                        currentScanFrequency = currentScanFrequency,
+                        startFrequency = scanStartFrequency,
+                        endFrequency = scanEndFrequency,
+                        threshold = scanThreshold,
+                        stepSize = scanStepSize,
+                        dwellTime = scanDwellTime,
+                        detectionMode = scanDetectionMode,
+                        noiseFloorMargin = scanNoiseFloorMargin,
+                        enableSignalGrouping = scanEnableSignalGrouping,
+                        minimumGap = scanMinimumGap,
+                        noiseFloor = noiseFloorLevel,
+                        discoveredSignals = discoveredSignals,
+                        scanTabActions = scanTabActions
                     )
                 AnalyzerTabs.SETTINGS
                     -> SettingsTabComposable(

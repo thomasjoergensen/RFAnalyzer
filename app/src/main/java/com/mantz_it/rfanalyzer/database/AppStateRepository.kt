@@ -18,6 +18,7 @@ import com.mantz_it.rfanalyzer.ui.composable.FftDrawingType
 import com.mantz_it.rfanalyzer.ui.composable.FftWaterfallSpeed
 import com.mantz_it.rfanalyzer.ui.composable.FilesourceFileFormat
 import com.mantz_it.rfanalyzer.ui.composable.FontSize
+import com.mantz_it.rfanalyzer.ui.composable.ScanDetectionMode
 import com.mantz_it.rfanalyzer.ui.composable.ScreenOrientation
 import com.mantz_it.rfanalyzer.ui.composable.SourceType
 import com.mantz_it.rfanalyzer.ui.composable.StopAfterUnit
@@ -238,6 +239,23 @@ class AppStateRepository @Inject constructor(
     val recordingCurrentFileSize = MutableState(0L)
     val recordingStartedTimestamp = MutableState(0L)
     val recordingDirectoryUri = Setting("recordingDirectoryUri", "", scope, dataStore) // Empty = use internal storage, otherwise SAF content:// URI
+
+    // Scan Tab
+    val scanStartFrequency = Setting("scanStartFrequency", 400000000L, scope, dataStore) // 400 MHz
+    val scanEndFrequency = Setting("scanEndFrequency", 700000000L, scope, dataStore) // 700 MHz
+    val scanThreshold = Setting("scanThreshold", -60f, scope, dataStore) // -60 dB
+    val scanStepSize = Setting("scanStepSize", 1000000L, scope, dataStore) // 1 MHz
+    val scanDwellTime = Setting("scanDwellTime", 200L, scope, dataStore) // 200 ms
+    val scanDetectionMode = Setting("scanDetectionMode", ScanDetectionMode.PEAK_ONLY, scope, dataStore)
+    val scanNoiseFloorMargin = Setting("scanNoiseFloorMargin", 10f, scope, dataStore) // dB above noise floor
+    val scanEnableSignalGrouping = Setting("scanEnableSignalGrouping", true, scope, dataStore)
+    val scanMinimumGap = Setting("scanMinimumGap", 2, scope, dataStore) // Minimum gap in multiples of step size
+    val scanRunning = MutableState(false)
+    val scanProgress = MutableState(0f) // 0.0 to 1.0
+    val currentScanFrequency = MutableState(0L)
+    val discoveredSignals = MutableState<List<DiscoveredSignal>>(emptyList())
+    val currentScanResultId = MutableState<Long?>(null) // ID of the current scan result in database
+    val noiseFloorLevel = MutableState(-999f) // Estimated noise floor in dB
 
     // Settings Tab
     val screenOrientation = Setting("screenOrientation", ScreenOrientation.AUTO, scope, dataStore)

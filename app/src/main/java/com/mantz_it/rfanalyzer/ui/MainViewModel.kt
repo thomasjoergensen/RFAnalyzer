@@ -13,8 +13,11 @@ import com.mantz_it.rfanalyzer.database.AppStateRepository
 import com.mantz_it.rfanalyzer.database.AppStateRepository.Companion.DEFAULT_VERTICAL_SCALE_MAX
 import com.mantz_it.rfanalyzer.database.AppStateRepository.Companion.DEFAULT_VERTICAL_SCALE_MIN
 import com.mantz_it.rfanalyzer.database.BillingRepositoryInterface
+import com.mantz_it.rfanalyzer.database.DiscoveredSignal
 import com.mantz_it.rfanalyzer.database.Recording
 import com.mantz_it.rfanalyzer.database.RecordingDao
+import com.mantz_it.rfanalyzer.database.ScanDao
+import com.mantz_it.rfanalyzer.database.ScanResult
 import com.mantz_it.rfanalyzer.database.calculateFileName
 import com.mantz_it.rfanalyzer.database.collectAppState
 import com.mantz_it.rfanalyzer.source.AirspySource
@@ -26,6 +29,8 @@ import com.mantz_it.rfanalyzer.ui.composable.DemodulationTabActions
 import com.mantz_it.rfanalyzer.ui.composable.DisplayTabActions
 import com.mantz_it.rfanalyzer.ui.composable.FilesourceFileFormat
 import com.mantz_it.rfanalyzer.ui.composable.RecordingTabActions
+import com.mantz_it.rfanalyzer.ui.composable.ScanDetectionMode
+import com.mantz_it.rfanalyzer.ui.composable.ScanTabActions
 import com.mantz_it.rfanalyzer.ui.composable.SettingsTabActions
 import com.mantz_it.rfanalyzer.ui.composable.SourceTabActions
 import com.mantz_it.rfanalyzer.ui.composable.SourceType
@@ -93,6 +98,7 @@ class MainViewModel @Inject constructor(
     @ApplicationContext private val context: Context,
     private val appStateRepository: AppStateRepository,
     private val recordingDao:RecordingDao,
+    private val scanDao: ScanDao,
     private val billingRepository: BillingRepositoryInterface
 ) : ViewModel() {
     companion object {
@@ -464,6 +470,396 @@ class MainViewModel @Inject constructor(
         onViewRecordingsClicked = { navigate(AppScreen.RecordingScreen) },
         onChooseRecordingDirectoryClicked = { sendActionToUi(UiAction.OnChooseRecordingDirectoryClicked) }
     )
+
+    // Scan Tab
+    private var scanJob: kotlinx.coroutines.Job? = null
+
+    val scanTabActions = ScanTabActions(
+        onStartFrequencyChanged = appStateRepository.scanStartFrequency::set,
+        onEndFrequencyChanged = appStateRepository.scanEndFrequency::set,
+        onThresholdChanged = appStateRepository.scanThreshold::set,
+        onStepSizeChanged = appStateRepository.scanStepSize::set,
+        onDwellTimeChanged = appStateRepository.scanDwellTime::set,
+        onDetectionModeChanged = appStateRepository.scanDetectionMode::set,
+        onNoiseFloorMarginChanged = appStateRepository.scanNoiseFloorMargin::set,
+        onSignalGroupingChanged = appStateRepository.scanEnableSignalGrouping::set,
+        onMinimumGapChanged = appStateRepository.scanMinimumGap::set,
+        onStartScanClicked = { startScanning() },
+        onStopScanClicked = { stopScanning() },
+        onClearResultsClicked = {
+            appStateRepository.discoveredSignals.set(emptyList())
+            appStateRepository.currentScanResultId.set(null)
+            appStateRepository.noiseFloorLevel.set(-999f)
+        },
+        onTuneToSignal = { frequency ->
+            if (!appStateRepository.scanRunning.value) {
+                appStateRepository.sourceFrequency.set(frequency)
+                // Center the channel on the frequency
+                appStateRepository.channelFrequency.set(frequency)
+            }
+        },
+        onRemoveSignal = { signal ->
+            val currentSignals = appStateRepository.discoveredSignals.value
+            appStateRepository.discoveredSignals.set(currentSignals.filter { it.frequency != signal.frequency })
+        }
+    )
+
+    private fun startScanning() {
+        // Validate preconditions
+        if (!appStateRepository.analyzerRunning.value) {
+            showSnackbar(SnackbarEvent("Analyzer must be running to scan"))
+            return
+        }
+        if (appStateRepository.recordingRunning.value) {
+            showSnackbar(SnackbarEvent("Cannot scan while recording is active"))
+            return
+        }
+        if (appStateRepository.scanStartFrequency.value >= appStateRepository.scanEndFrequency.value) {
+            showSnackbar(SnackbarEvent("Start frequency must be less than end frequency"))
+            return
+        }
+
+        // Start scanning
+        appStateRepository.scanRunning.set(true)
+        appStateRepository.scanProgress.set(0f)
+        appStateRepository.discoveredSignals.set(emptyList())
+
+        val startFreq = appStateRepository.scanStartFrequency.value
+        val endFreq = appStateRepository.scanEndFrequency.value
+        val stepSize = appStateRepository.scanStepSize.value
+        val dwellTime = appStateRepository.scanDwellTime.value
+        val threshold = appStateRepository.scanThreshold.value
+        val detectionMode = appStateRepository.scanDetectionMode.value
+        val noiseFloorMargin = appStateRepository.scanNoiseFloorMargin.value
+        val enableGrouping = appStateRepository.scanEnableSignalGrouping.value
+        val minimumGap = appStateRepository.scanMinimumGap.value
+
+        scanJob = viewModelScope.launch {
+            val rawDetectionsList = mutableListOf<DiscoveredSignal>()
+
+            try {
+                // Get current sample rate (FFT bandwidth)
+                val sampleRate = appStateRepository.sourceSampleRate.value
+
+                // Use middle 80% of FFT bandwidth to avoid edge effects
+                val usableBandwidth = (sampleRate * 0.8).toLong()
+
+                Log.d(TAG, "Scanning with FFT bandwidth optimization: sampleRate=$sampleRate, usableBandwidth=$usableBandwidth")
+
+                // Step 1: Estimate noise floor (sample 5 positions across the range)
+                val noiseFloorSamples = mutableListOf<Float>()
+                for (i in 0 until 5) {
+                    val sampleFreq = startFreq + (i * (endFreq - startFreq) / 5)
+                    appStateRepository.sourceFrequency.set(sampleFreq)
+                    delay(dwellTime)
+                    val avgLevel = getAverageSignalLevel()
+                    if (avgLevel != null) noiseFloorSamples.add(avgLevel)
+                }
+                val noiseFloor = if (noiseFloorSamples.isNotEmpty()) {
+                    noiseFloorSamples.average().toFloat()
+                } else {
+                    -80f // Default if estimation fails
+                }
+                appStateRepository.noiseFloorLevel.set(noiseFloor)
+                Log.d(TAG, "Estimated noise floor: $noiseFloor dB, margin: $noiseFloorMargin dB")
+
+                // Step 2: Scan using FFT bandwidth (much more efficient!)
+                // Instead of tuning to each frequency, we tune once and analyze the entire FFT
+                var tuneFrequency = startFreq
+                val totalRange = endFreq - startFreq
+                var scannedRange = 0L
+
+                while (tuneFrequency <= endFreq && appStateRepository.scanRunning.value) {
+                    // Tune to this position
+                    appStateRepository.sourceFrequency.set(tuneFrequency)
+                    appStateRepository.currentScanFrequency.set(tuneFrequency)
+
+                    // Wait for FFT to settle
+                    delay(dwellTime)
+
+                    // Analyze all frequencies in the usable FFT bandwidth
+                    val detectedSignals = detectSignalsInFFT(
+                        tuneFrequency,
+                        sampleRate,
+                        usableBandwidth,
+                        stepSize,
+                        threshold,
+                        detectionMode,
+                        noiseFloor,
+                        noiseFloorMargin,
+                        startFreq,
+                        endFreq
+                    )
+
+                    rawDetectionsList.addAll(detectedSignals)
+
+                    // Update progress
+                    scannedRange = minOf(tuneFrequency - startFreq + usableBandwidth, totalRange)
+                    val progress = scannedRange.toFloat() / totalRange
+                    appStateRepository.scanProgress.set(progress)
+
+                    // Move to next FFT window (with small overlap to avoid missing signals)
+                    tuneFrequency += (usableBandwidth * 0.9).toLong()
+                }
+
+                // Step 3: Group signals if enabled
+                val finalSignalsList = if (enableGrouping && rawDetectionsList.isNotEmpty()) {
+                    groupSignals(rawDetectionsList, stepSize, minimumGap)
+                } else {
+                    rawDetectionsList
+                }
+
+                // Update UI with final results
+                appStateRepository.discoveredSignals.set(finalSignalsList)
+
+                // Save scan results to database
+                if (finalSignalsList.isNotEmpty()) {
+                    withContext(Dispatchers.IO) {
+                        val scanResult = ScanResult(
+                            timestamp = System.currentTimeMillis(),
+                            startFrequency = startFreq,
+                            endFrequency = endFreq,
+                            threshold = threshold,
+                            stepSize = stepSize,
+                            dwellTime = dwellTime
+                        )
+                        val scanResultId = scanDao.saveScanWithSignals(scanResult, finalSignalsList)
+                        appStateRepository.currentScanResultId.set(scanResultId)
+                    }
+                }
+
+                showSnackbar(SnackbarEvent("Scan complete. Found ${finalSignalsList.size} signals (${rawDetectionsList.size} raw detections)."))
+            } catch (e: Exception) {
+                Log.e(TAG, "Error during scanning", e)
+                showSnackbar(SnackbarEvent("Scan failed: ${e.message}"))
+            } finally {
+                appStateRepository.scanRunning.set(false)
+            }
+        }
+    }
+
+    private fun stopScanning() {
+        scanJob?.cancel()
+        appStateRepository.scanRunning.set(false)
+        showSnackbar(SnackbarEvent("Scan stopped"))
+    }
+
+    private fun getAverageSignalLevel(): Float? {
+        val fftProcessorData = appStateRepository.fftProcessorData
+        return try {
+            fftProcessorData.lock.readLock().lock()
+            try {
+                val waterfallBuffer = fftProcessorData.waterfallBuffer
+                if (waterfallBuffer == null || waterfallBuffer.isEmpty()) return null
+
+                val readIndex = fftProcessorData.readIndex
+                if (readIndex < 0 || readIndex >= waterfallBuffer.size) return null
+
+                val currentFFT = waterfallBuffer[readIndex]
+                if (currentFFT.isEmpty()) return null
+
+                currentFFT.average().toFloat()
+            } finally {
+                fftProcessorData.lock.readLock().unlock()
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error getting average signal level", e)
+            null
+        }
+    }
+
+    private fun detectSignal(threshold: Float, mode: ScanDetectionMode, noiseFloor: Float, noiseFloorMargin: Float): Pair<Float, Float>? {
+        val fftProcessorData = appStateRepository.fftProcessorData
+
+        return try {
+            fftProcessorData.lock.readLock().lock()
+            try {
+                val waterfallBuffer = fftProcessorData.waterfallBuffer
+                if (waterfallBuffer == null || waterfallBuffer.isEmpty()) return null
+
+                val readIndex = fftProcessorData.readIndex
+                if (readIndex < 0 || readIndex >= waterfallBuffer.size) return null
+
+                val currentFFT = waterfallBuffer[readIndex]
+                if (currentFFT.isEmpty()) return null
+
+                // Calculate peak and average signal strength
+                val peakSignal = currentFFT.maxOrNull() ?: return null
+                val avgSignal = currentFFT.average().toFloat()
+
+                // Use noise floor + margin as effective threshold
+                val effectiveThreshold = maxOf(threshold, noiseFloor + noiseFloorMargin)
+
+                // Apply detection mode
+                val detected = when (mode) {
+                    ScanDetectionMode.PEAK_ONLY -> peakSignal > effectiveThreshold
+                    ScanDetectionMode.AVERAGE_ONLY -> avgSignal > effectiveThreshold
+                    ScanDetectionMode.PEAK_OR_AVERAGE -> peakSignal > effectiveThreshold || avgSignal > effectiveThreshold
+                }
+
+                if (detected) {
+                    Pair(peakSignal, avgSignal)
+                } else {
+                    null
+                }
+            } finally {
+                fftProcessorData.lock.readLock().unlock()
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error detecting signal", e)
+            null
+        }
+    }
+
+    /**
+     * Analyzes all frequencies in the current FFT and returns detected signals
+     * This is much more efficient than tuning to each individual frequency
+     */
+    private fun detectSignalsInFFT(
+        centerFrequency: Long,
+        sampleRate: Long,
+        usableBandwidth: Long,
+        stepSize: Long,
+        threshold: Float,
+        mode: ScanDetectionMode,
+        noiseFloor: Float,
+        noiseFloorMargin: Float,
+        scanStartFreq: Long,
+        scanEndFreq: Long
+    ): List<DiscoveredSignal> {
+        val fftProcessorData = appStateRepository.fftProcessorData
+        val detectedSignals = mutableListOf<DiscoveredSignal>()
+
+        try {
+            fftProcessorData.lock.readLock().lock()
+            try {
+                val waterfallBuffer = fftProcessorData.waterfallBuffer ?: return emptyList()
+                if (waterfallBuffer.isEmpty()) return emptyList()
+
+                val readIndex = fftProcessorData.readIndex
+                if (readIndex < 0 || readIndex >= waterfallBuffer.size) return emptyList()
+
+                val currentFFT = waterfallBuffer[readIndex]
+                if (currentFFT.isEmpty()) return emptyList()
+
+                // Calculate FFT parameters
+                val fftSize = currentFFT.size
+                val frequencyResolution = sampleRate.toFloat() / fftSize
+                val startFrequency = centerFrequency - sampleRate / 2
+                val usableStartOffset = ((sampleRate - usableBandwidth) / 2).toLong()
+                val usableEndOffset = usableStartOffset + usableBandwidth
+
+                // Use noise floor + margin as effective threshold
+                val effectiveThreshold = maxOf(threshold, noiseFloor + noiseFloorMargin)
+
+                // Scan through the FFT at stepSize intervals
+                var currentFreq = maxOf(scanStartFreq, startFrequency + usableStartOffset)
+                val endFreq = minOf(scanEndFreq, startFrequency + usableEndOffset)
+
+                while (currentFreq <= endFreq) {
+                    // Calculate FFT bin index for this frequency
+                    val binIndex = ((currentFreq - startFrequency) / frequencyResolution).toInt()
+
+                    if (binIndex in currentFFT.indices) {
+                        // Analyze a small window around the bin (e.g., ±2 bins)
+                        val windowStart = maxOf(0, binIndex - 2)
+                        val windowEnd = minOf(currentFFT.size - 1, binIndex + 2)
+
+                        val windowData = currentFFT.sliceArray(windowStart..windowEnd)
+                        val peakSignal = windowData.maxOrNull() ?: 0f
+                        val avgSignal = windowData.average().toFloat()
+
+                        // Apply detection mode
+                        val detected = when (mode) {
+                            ScanDetectionMode.PEAK_ONLY -> peakSignal > effectiveThreshold
+                            ScanDetectionMode.AVERAGE_ONLY -> avgSignal > effectiveThreshold
+                            ScanDetectionMode.PEAK_OR_AVERAGE -> peakSignal > effectiveThreshold || avgSignal > effectiveThreshold
+                        }
+
+                        if (detected) {
+                            detectedSignals.add(
+                                DiscoveredSignal(
+                                    id = 0,
+                                    scanResultId = 0,
+                                    frequency = currentFreq,
+                                    peakStrength = peakSignal,
+                                    averageStrength = avgSignal,
+                                    bandwidth = 0,
+                                    isGrouped = false
+                                )
+                            )
+                        }
+                    }
+
+                    currentFreq += stepSize
+                }
+
+            } finally {
+                fftProcessorData.lock.readLock().unlock()
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error detecting signals in FFT", e)
+        }
+
+        return detectedSignals
+    }
+
+    private fun groupSignals(signals: List<DiscoveredSignal>, stepSize: Long, minimumGap: Int): List<DiscoveredSignal> {
+        if (signals.isEmpty()) return emptyList()
+
+        // Sort signals by frequency
+        val sortedSignals = signals.sortedBy { it.frequency }
+        val groupedSignals = mutableListOf<DiscoveredSignal>()
+        val gapThreshold = stepSize * minimumGap
+
+        var currentGroup = mutableListOf<DiscoveredSignal>()
+        currentGroup.add(sortedSignals[0])
+
+        for (i in 1 until sortedSignals.size) {
+            val prevSignal = sortedSignals[i - 1]
+            val currentSignal = sortedSignals[i]
+            val gap = currentSignal.frequency - prevSignal.frequency
+
+            if (gap <= gapThreshold) {
+                // Signals are close, add to current group
+                currentGroup.add(currentSignal)
+            } else {
+                // Gap is too large, finalize current group and start new one
+                groupedSignals.add(finalizeGroup(currentGroup))
+                currentGroup = mutableListOf(currentSignal)
+            }
+        }
+
+        // Finalize last group
+        groupedSignals.add(finalizeGroup(currentGroup))
+
+        return groupedSignals
+    }
+
+    private fun finalizeGroup(group: List<DiscoveredSignal>): DiscoveredSignal {
+        if (group.size == 1) {
+            // Single signal, return as-is
+            return group[0]
+        }
+
+        // Multiple signals, create grouped signal
+        val minFreq = group.minOf { it.frequency }
+        val maxFreq = group.maxOf { it.frequency }
+        val centerFreq = (minFreq + maxFreq) / 2
+        val bandwidth = maxFreq - minFreq
+        val maxPeak = group.maxOf { it.peakStrength }
+        val avgOfAverages = group.map { it.averageStrength }.average().toFloat()
+
+        return DiscoveredSignal(
+            id = 0,
+            scanResultId = 0,
+            frequency = centerFreq,
+            peakStrength = maxPeak,
+            averageStrength = avgOfAverages,
+            bandwidth = bandwidth,
+            isGrouped = true
+        )
+    }
 
     val settingsTabActions = SettingsTabActions(
         onScreenOrientationChanged = appStateRepository.screenOrientation::set,

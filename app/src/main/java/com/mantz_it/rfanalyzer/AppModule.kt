@@ -9,8 +9,11 @@ import com.mantz_it.rfanalyzer.database.AppDatabase
 import com.mantz_it.rfanalyzer.database.AppStateRepository
 import com.mantz_it.rfanalyzer.database.BillingRepository
 import com.mantz_it.rfanalyzer.database.BillingRepositoryInterface
+import com.mantz_it.rfanalyzer.database.MIGRATION_1_2
+import com.mantz_it.rfanalyzer.database.MIGRATION_2_3
 import com.mantz_it.rfanalyzer.database.MockedBillingRepository
 import com.mantz_it.rfanalyzer.database.RecordingDao
+import com.mantz_it.rfanalyzer.database.ScanDao
 import dagger.Module
 import dagger.Provides
 import dagger.hilt.InstallIn
@@ -58,12 +61,18 @@ object AppModule {
             context,
             AppDatabase::class.java,
             "recordings_db"
-        ).build()
+        ).addMigrations(MIGRATION_1_2, MIGRATION_2_3)
+            .build()
     }
 
     @Provides
     fun provideRecordingDao(db: AppDatabase): RecordingDao {
         return db.recordingDao()
+    }
+
+    @Provides
+    fun provideScanDao(db: AppDatabase): ScanDao {
+        return db.scanDao()
     }
 
     @Provides
