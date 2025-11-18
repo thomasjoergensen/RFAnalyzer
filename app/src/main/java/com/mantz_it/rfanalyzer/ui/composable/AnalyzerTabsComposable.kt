@@ -53,6 +53,7 @@ enum class AnalyzerTabs(val displayName: String) {
     RECORDING("Recording"),
     SCAN("Scan"),
     IEM_PRESETS("IEM Presets"),
+    AIR_COMM("Air Comm"),
     DISPLAY("Display"),
     SETTINGS("Settings"),
     ABOUT("About")
@@ -71,6 +72,7 @@ fun AnalyzerTabsComposable(
     scanTabActions: ScanTabActions,
     iemPresetsTabActions: IEMPresetsTabActions,
     availableIEMPresets: List<IEMPreset>,
+    airCommTabActions: AirCommTabActions,
     settingsTabActions: SettingsTabActions,
     aboutTabActions: AboutTabActions,
 ) {
@@ -172,6 +174,19 @@ fun AnalyzerTabsComposable(
     val iemDetectionThreshold by appStateRepository.iemDetectionThreshold.stateFlow.collectAsState()
     val iemNoiseFloorMargin by appStateRepository.iemNoiseFloorMargin.stateFlow.collectAsState()
     val iemUseNoiseFloor by appStateRepository.iemUseNoiseFloor.stateFlow.collectAsState()
+    val airCommStartFrequency by appStateRepository.airCommStartFrequency.stateFlow.collectAsState()
+    val airCommEndFrequency by appStateRepository.airCommEndFrequency.stateFlow.collectAsState()
+    val airCommStepSize by appStateRepository.airCommStepSize.stateFlow.collectAsState()
+    val airCommDwellTime by appStateRepository.airCommDwellTime.stateFlow.collectAsState()
+    val airCommHangTime by appStateRepository.airCommHangTime.stateFlow.collectAsState()
+    val airCommDetectionThreshold by appStateRepository.airCommDetectionThreshold.stateFlow.collectAsState()
+    val airCommNoiseFloorMargin by appStateRepository.airCommNoiseFloorMargin.stateFlow.collectAsState()
+    val airCommUseNoiseFloor by appStateRepository.airCommUseNoiseFloor.stateFlow.collectAsState()
+    val airCommScanRunning by appStateRepository.airCommScanRunning.stateFlow.collectAsState()
+    val airCommCurrentFrequency by appStateRepository.airCommCurrentFrequency.stateFlow.collectAsState()
+    val airCommSignalDetected by appStateRepository.airCommSignalDetected.stateFlow.collectAsState()
+    val airCommSignalStrength by appStateRepository.airCommSignalStrength.stateFlow.collectAsState()
+    val airCommExceptionList by appStateRepository.airCommExceptionList.stateFlow.collectAsState()
     val screenOrientation by appStateRepository.screenOrientation.stateFlow.collectAsState()
     val fontSize by appStateRepository.fontSize.stateFlow.collectAsState()
     val colorTheme by appStateRepository.colorTheme.stateFlow.collectAsState()
@@ -342,6 +357,25 @@ fun AnalyzerTabsComposable(
                         noiseFloorMargin = iemNoiseFloorMargin,
                         useNoiseFloor = iemUseNoiseFloor,
                         iemPresetsTabActions = iemPresetsTabActions
+                    )
+                AnalyzerTabs.AIR_COMM
+                    -> AirCommTabComposable(
+                        analyzerRunning = analyzerRunning,
+                        recordingRunning = recordingRunning,
+                        airCommScanRunning = airCommScanRunning,
+                        currentFrequency = airCommCurrentFrequency,
+                        signalDetected = airCommSignalDetected,
+                        signalStrength = airCommSignalStrength,
+                        startFrequency = airCommStartFrequency,
+                        endFrequency = airCommEndFrequency,
+                        stepSize = airCommStepSize,
+                        dwellTime = airCommDwellTime,
+                        hangTime = airCommHangTime,
+                        detectionThreshold = airCommDetectionThreshold,
+                        noiseFloorMargin = airCommNoiseFloorMargin,
+                        useNoiseFloor = airCommUseNoiseFloor,
+                        exceptionList = airCommExceptionList,
+                        airCommTabActions = airCommTabActions
                     )
                 AnalyzerTabs.SETTINGS
                     -> SettingsTabComposable(

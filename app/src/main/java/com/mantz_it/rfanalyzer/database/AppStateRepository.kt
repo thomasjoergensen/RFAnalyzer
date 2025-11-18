@@ -279,6 +279,21 @@ class AppStateRepository @Inject constructor(
     val iemDetectedChannels = MutableState<List<IEMDetectedChannelInfo>>(emptyList())
     val iemCurrentScanResultId = MutableState<Long?>(null) // ID of the current scan result in database
 
+    // Air Communication Scanner
+    val airCommStartFrequency = Setting("airCommStartFrequency", 118000000L, scope, dataStore) // 118 MHz - Aviation VHF start
+    val airCommEndFrequency = Setting("airCommEndFrequency", 137000000L, scope, dataStore) // 137 MHz - Aviation VHF end
+    val airCommStepSize = Setting("airCommStepSize", 25000L, scope, dataStore) // 25 kHz step (standard aviation spacing)
+    val airCommDwellTime = Setting("airCommDwellTime", 100L, scope, dataStore) // 100ms dwell time per frequency
+    val airCommHangTime = Setting("airCommHangTime", 3000L, scope, dataStore) // 3 seconds hang time after signal drops
+    val airCommDetectionThreshold = Setting("airCommDetectionThreshold", -40f, scope, dataStore) // -40 dB threshold
+    val airCommNoiseFloorMargin = Setting("airCommNoiseFloorMargin", 15f, scope, dataStore) // 15 dB margin above noise floor
+    val airCommUseNoiseFloor = Setting("airCommUseNoiseFloor", true, scope, dataStore) // Use adaptive noise floor detection
+    val airCommScanRunning = MutableState(false) // Is scanner actively running
+    val airCommCurrentFrequency = MutableState(0L) // Current frequency being scanned
+    val airCommSignalDetected = MutableState(false) // Is scanner paused on a signal
+    val airCommSignalStrength = MutableState(-999f) // Current signal strength in dB
+    val airCommExceptionList = MutableState<Set<Long>>(emptySet()) // Frequencies to skip during scanning
+
     // Recordings Screen
     val displayOnlyFavoriteRecordings = Setting("displayOnlyFavoriteRecordings", false, scope, dataStore)
 

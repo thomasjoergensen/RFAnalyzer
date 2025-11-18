@@ -32,6 +32,7 @@ import com.mantz_it.rfanalyzer.ui.composable.DemodulationMode
 import com.mantz_it.rfanalyzer.ui.composable.DemodulationTabActions
 import com.mantz_it.rfanalyzer.ui.composable.DisplayTabActions
 import com.mantz_it.rfanalyzer.ui.composable.FilesourceFileFormat
+import com.mantz_it.rfanalyzer.ui.composable.AirCommTabActions
 import com.mantz_it.rfanalyzer.ui.composable.RecordingTabActions
 import com.mantz_it.rfanalyzer.ui.composable.ScanDetectionMode
 import com.mantz_it.rfanalyzer.ui.composable.IEMPresetsTabActions
@@ -45,6 +46,7 @@ import com.mantz_it.rfanalyzer.ui.composable.saturationFunction
 import com.mantz_it.rfanalyzer.ui.screens.RecordingScreenActions
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -555,6 +557,52 @@ class MainViewModel @Inject constructor(
         onUseNoiseFloorChanged = appStateRepository.iemUseNoiseFloor::set
     )
 
+    // Air Communication Scanner Tab
+    private var airCommScanJob: kotlinx.coroutines.Job? = null
+
+    val airCommTabActions = AirCommTabActions(
+        onStartFrequencyChanged = appStateRepository.airCommStartFrequency::set,
+        onEndFrequencyChanged = appStateRepository.airCommEndFrequency::set,
+        onStepSizeChanged = appStateRepository.airCommStepSize::set,
+        onDwellTimeChanged = appStateRepository.airCommDwellTime::set,
+        onHangTimeChanged = appStateRepository.airCommHangTime::set,
+        onDetectionThresholdChanged = appStateRepository.airCommDetectionThreshold::set,
+        onNoiseFloorMarginChanged = appStateRepository.airCommNoiseFloorMargin::set,
+        onUseNoiseFloorChanged = appStateRepository.airCommUseNoiseFloor::set,
+        onStartScanClicked = { startAirCommScanning() },
+        onStopScanClicked = { stopAirCommScanning() },
+        onAddToExceptionList = { frequency ->
+            val current = appStateRepository.airCommExceptionList.value.toMutableSet()
+            current.add(frequency)
+            appStateRepository.airCommExceptionList.set(current)
+            Log.d(TAG, "Air Comm: Added ${frequency.asStringWithUnit("Hz")} to exception list")
+        },
+        onRemoveFromExceptionList = { frequency ->
+            val current = appStateRepository.airCommExceptionList.value.toMutableSet()
+            current.remove(frequency)
+            appStateRepository.airCommExceptionList.set(current)
+            Log.d(TAG, "Air Comm: Removed ${frequency.asStringWithUnit("Hz")} from exception list")
+        },
+        onClearExceptionList = {
+            appStateRepository.airCommExceptionList.set(emptySet())
+            Log.d(TAG, "Air Comm: Cleared exception list")
+        },
+        onResetToDefaults = {
+            // Reset all Air Comm settings to default values
+            appStateRepository.airCommStartFrequency.set(118000000L) // 118 MHz
+            appStateRepository.airCommEndFrequency.set(137000000L)   // 137 MHz
+            appStateRepository.airCommStepSize.set(25000L)           // 25 kHz
+            appStateRepository.airCommDwellTime.set(100L)            // 100ms
+            appStateRepository.airCommHangTime.set(3000L)            // 3 seconds
+            appStateRepository.airCommDetectionThreshold.set(-40f)   // -40 dB
+            appStateRepository.airCommNoiseFloorMargin.set(15f)      // 15 dB
+            appStateRepository.airCommUseNoiseFloor.set(true)        // Use adaptive detection
+            appStateRepository.airCommExceptionList.set(emptySet())  // Clear exception list
+            Log.d(TAG, "Air Comm: Reset all settings to defaults")
+            showSnackbar(SnackbarEvent("Air Comm settings reset to defaults"))
+        }
+    )
+
     private fun startIEMScanning() {
         // Validate preconditions
         if (!appStateRepository.analyzerRunning.value) {
@@ -806,6 +854,325 @@ class MainViewModel @Inject constructor(
         }
 
         return detectedChannels
+    }
+
+    // ===== Air Communication Scanner Functions =====
+
+    private fun startAirCommScanning() {
+        // Validate preconditions
+        if (!appStateRepository.analyzerRunning.value) {
+            showSnackbar(SnackbarEvent("Analyzer must be running to scan air communications"))
+            return
+        }
+        if (appStateRepository.recordingRunning.value) {
+            showSnackbar(SnackbarEvent("Cannot scan while recording is active"))
+            return
+        }
+
+        val startFreq = appStateRepository.airCommStartFrequency.value
+        val endFreq = appStateRepository.airCommEndFrequency.value
+
+        if (startFreq >= endFreq) {
+            showSnackbar(SnackbarEvent("Start frequency must be less than end frequency"))
+            return
+        }
+
+        // Start Air Comm scanning
+        appStateRepository.airCommScanRunning.set(true)
+        appStateRepository.airCommSignalDetected.set(false)
+        appStateRepository.airCommCurrentFrequency.set(startFreq)
+
+        val stepSize = appStateRepository.airCommStepSize.value
+        val dwellTime = appStateRepository.airCommDwellTime.value
+        val hangTime = appStateRepository.airCommHangTime.value
+        val useNoiseFloor = appStateRepository.airCommUseNoiseFloor.value
+        val fixedThreshold = appStateRepository.airCommDetectionThreshold.value
+        val noiseFloorMargin = appStateRepository.airCommNoiseFloorMargin.value
+
+        // Auto-enable AM demodulation for air communications
+        if (appStateRepository.demodulationMode.value != DemodulationMode.AM) {
+            appStateRepository.demodulationMode.set(DemodulationMode.AM)
+            Log.d(TAG, "Air Comm Scan: Auto-enabled AM demodulation")
+        }
+
+        airCommScanJob = viewModelScope.launch {
+            try {
+                // Estimate noise floor if enabled
+                var noiseFloor = -80f
+                if (useNoiseFloor) {
+                    val noiseFloorSamples = mutableListOf<Float>()
+                    // Sample 3 frequencies across the range
+                    for (i in 0 until 3) {
+                        val sampleFreq = startFreq + (i * (endFreq - startFreq) / 3)
+                        appStateRepository.sourceFrequency.set(sampleFreq)
+                        delay(dwellTime)
+                        val avgLevel = getAverageSignalLevel()
+                        if (avgLevel != null) noiseFloorSamples.add(avgLevel)
+                    }
+
+                    noiseFloor = if (noiseFloorSamples.isNotEmpty()) {
+                        noiseFloorSamples.average().toFloat()
+                    } else {
+                        -80f
+                    }
+                    appStateRepository.noiseFloorLevel.set(noiseFloor)
+                    Log.d(TAG, "Air Comm Scan: Estimated noise floor: $noiseFloor dB, margin: $noiseFloorMargin dB")
+                }
+
+                // Calculate effective threshold
+                val effectiveThreshold = if (useNoiseFloor) {
+                    noiseFloor + noiseFloorMargin
+                } else {
+                    fixedThreshold
+                }
+
+                // Get sample rate and calculate FFT batching
+                val sampleRate = appStateRepository.sourceSampleRate.value
+                val usableBandwidth = (sampleRate * 0.8).toLong()
+
+                // Build list of target frequencies to scan
+                val targetFrequencies = mutableListOf<Long>()
+                var freq = startFreq
+                while (freq <= endFreq) {
+                    targetFrequencies.add(freq)
+                    freq += stepSize
+                }
+
+                // Group frequencies into batches based on FFT coverage
+                val frequencyBatches = mutableListOf<List<Long>>()
+                var currentBatch = mutableListOf<Long>()
+                var batchCenterFreq = 0L
+
+                for (targetFreq in targetFrequencies) {
+                    if (currentBatch.isEmpty()) {
+                        currentBatch.add(targetFreq)
+                        batchCenterFreq = targetFreq
+                    } else {
+                        val freqDiff = kotlin.math.abs(targetFreq - batchCenterFreq)
+                        // Can we fit this frequency in current batch's FFT window?
+                        if (freqDiff < usableBandwidth / 2) {
+                            currentBatch.add(targetFreq)
+                        } else {
+                            // Start new batch
+                            frequencyBatches.add(currentBatch)
+                            currentBatch = mutableListOf(targetFreq)
+                            batchCenterFreq = targetFreq
+                        }
+                    }
+                }
+                if (currentBatch.isNotEmpty()) {
+                    frequencyBatches.add(currentBatch)
+                }
+
+                Log.d(TAG, "Air Comm Scan: Starting continuous scan from ${startFreq.asStringWithUnit("Hz")} to ${endFreq.asStringWithUnit("Hz")}")
+                Log.d(TAG, "Air Comm Scan: Grouped ${targetFrequencies.size} frequencies into ${frequencyBatches.size} FFT batches (sample rate=${sampleRate.asStringWithUnit("Hz")}, usable=${usableBandwidth.asStringWithUnit("Hz")})")
+                Log.d(TAG, "Air Comm Scan: Effective threshold=$effectiveThreshold dB")
+
+                // Continuous scan loop
+                while (appStateRepository.airCommScanRunning.value) {
+                    // Scan through frequency batches
+                    for (batch in frequencyBatches) {
+                        if (!appStateRepository.airCommScanRunning.value) break
+
+                        // Calculate center frequency for this batch
+                        val batchCenter = (batch.first() + batch.last()) / 2
+
+                        // Tune to batch center frequency ONCE
+                        appStateRepository.sourceFrequency.set(batchCenter)
+
+                        // Wait for FFT to settle
+                        delay(dwellTime)
+
+                        // Check each frequency in this batch
+                        val exceptionList = appStateRepository.airCommExceptionList.value
+
+                        for (targetFreq in batch) {
+                            if (!appStateRepository.airCommScanRunning.value) break
+
+                            appStateRepository.airCommCurrentFrequency.set(targetFreq)
+
+                            // Skip if in exception list
+                            if (exceptionList.contains(targetFreq)) {
+                                continue
+                            }
+
+                            // Detect signal at this specific frequency within the FFT
+                            val signalStrength = detectAirCommSignalAtFrequency(targetFreq, batchCenter, sampleRate)
+                            appStateRepository.airCommSignalStrength.set(signalStrength ?: -999f)
+
+                            if (signalStrength != null && signalStrength > effectiveThreshold) {
+                                // SIGNAL DETECTED - PAUSE SCANNING
+                                appStateRepository.airCommSignalDetected.set(true)
+                                Log.d(TAG, "Air Comm Scan: Signal detected at ${targetFreq.asStringWithUnit("Hz")}, strength=$signalStrength dB - PAUSED")
+
+                                // Tune to the detected frequency for better reception
+                                appStateRepository.sourceFrequency.set(targetFreq)
+                                appStateRepository.channelFrequency.set(targetFreq)
+                                delay(dwellTime)
+
+                                // Monitor signal while active
+                                var addedToExceptionList = false
+                                while (appStateRepository.airCommScanRunning.value) {
+                                    delay(100) // Check signal every 100ms
+
+                                    // Check if this frequency was added to exception list
+                                    val currentExceptionList = appStateRepository.airCommExceptionList.value
+                                    if (currentExceptionList.contains(targetFreq)) {
+                                        Log.d(TAG, "Air Comm Scan: Frequency ${targetFreq.asStringWithUnit("Hz")} added to exception list, resuming scan")
+                                        addedToExceptionList = true
+                                        break
+                                    }
+
+                                    val currentSignal = detectAirCommSignal()
+                                    appStateRepository.airCommSignalStrength.set(currentSignal ?: -999f)
+
+                                    // Signal dropped below threshold
+                                    if (currentSignal == null || currentSignal <= effectiveThreshold) {
+                                        Log.d(TAG, "Air Comm Scan: Signal dropped, entering hang time (${hangTime}ms)")
+                                        break
+                                    }
+                                }
+
+                                // HANG TIME - Wait before resuming scan (skip if added to exception list)
+                                appStateRepository.airCommSignalDetected.set(false)
+                                if (!addedToExceptionList && hangTime > 0 && appStateRepository.airCommScanRunning.value) {
+                                    delay(hangTime)
+                                }
+
+                                // Break out of frequency loop to restart batch scanning
+                                break
+                            }
+                        }
+                    }
+
+                    // Loop completed, restart from beginning
+                    Log.d(TAG, "Air Comm Scan: Scan loop completed, restarting...")
+                }
+
+            } catch (e: CancellationException) {
+                // Normal cancellation - don't show error
+                throw e
+            } catch (e: Exception) {
+                Log.e(TAG, "Error during air comm scanning", e)
+                showSnackbar(SnackbarEvent("Air comm scan failed: ${e.message}"))
+            } finally {
+                appStateRepository.airCommScanRunning.set(false)
+                appStateRepository.airCommSignalDetected.set(false)
+                appStateRepository.airCommSignalStrength.set(-999f)
+            }
+        }
+    }
+
+    private fun stopAirCommScanning() {
+        airCommScanJob?.cancel()
+        appStateRepository.airCommScanRunning.set(false)
+        appStateRepository.airCommSignalDetected.set(false)
+        showSnackbar(SnackbarEvent("Air comm scan stopped"))
+    }
+
+    /**
+     * Detects air communication signals at current frequency
+     * Returns signal strength in dB or null if no signal detected
+     */
+    private fun detectAirCommSignal(): Float? {
+        val fftProcessorData = appStateRepository.fftProcessorData
+
+        return try {
+            fftProcessorData.lock.readLock().lock()
+            try {
+                val waterfallBuffer = fftProcessorData.waterfallBuffer ?: return null
+                if (waterfallBuffer.isEmpty()) return null
+
+                val readIndex = fftProcessorData.readIndex
+                if (readIndex < 0 || readIndex >= waterfallBuffer.size) return null
+
+                val currentFFT = waterfallBuffer[readIndex]
+                if (currentFFT.isEmpty()) return null
+
+                // For AM aviation signals, analyze center ±12.5 kHz window
+                // (25 kHz channel spacing, so ±12.5 kHz covers the signal)
+                val fftSize = currentFFT.size
+                val centerBin = fftSize / 2
+
+                // Calculate window size (±12.5 kHz)
+                val sampleRate = appStateRepository.sourceSampleRate.value
+                val frequencyResolution = sampleRate.toFloat() / fftSize
+                val windowHalfSize = (12500 / frequencyResolution).toInt().coerceAtLeast(3)
+
+                val windowStart = (centerBin - windowHalfSize).coerceAtLeast(0)
+                val windowEnd = (centerBin + windowHalfSize).coerceAtMost(currentFFT.size - 1)
+
+                val windowData = currentFFT.sliceArray(windowStart..windowEnd)
+                val peakSignal = windowData.maxOrNull() ?: return null
+
+                peakSignal
+
+            } finally {
+                fftProcessorData.lock.readLock().unlock()
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error detecting air comm signal", e)
+            null
+        }
+    }
+
+    /**
+     * Detects air communication signal at a specific frequency within the current FFT
+     * Used for FFT batching optimization - analyzes targetFreq when tuned to batchCenter
+     *
+     * @param targetFreq The actual frequency to check for signal
+     * @param batchCenter The frequency we're currently tuned to
+     * @param sampleRate Current sample rate (determines FFT coverage)
+     * @return Signal strength in dB or null if no signal detected
+     */
+    private fun detectAirCommSignalAtFrequency(
+        targetFreq: Long,
+        batchCenter: Long,
+        sampleRate: Long
+    ): Float? {
+        val fftProcessorData = appStateRepository.fftProcessorData
+
+        return try {
+            fftProcessorData.lock.readLock().lock()
+            try {
+                val waterfallBuffer = fftProcessorData.waterfallBuffer ?: return null
+                if (waterfallBuffer.isEmpty()) return null
+
+                val readIndex = fftProcessorData.readIndex
+                if (readIndex < 0 || readIndex >= waterfallBuffer.size) return null
+
+                val currentFFT = waterfallBuffer[readIndex]
+                if (currentFFT.isEmpty()) return null
+
+                // Calculate FFT parameters
+                val fftSize = currentFFT.size
+                val frequencyResolution = sampleRate.toFloat() / fftSize
+                val startFrequency = batchCenter - sampleRate / 2
+
+                // Calculate bin index for target frequency
+                val frequencyOffset = targetFreq - startFrequency
+                val binIndex = (frequencyOffset / frequencyResolution).toInt()
+
+                // Check if target frequency is within FFT range
+                if (binIndex !in currentFFT.indices) return null
+
+                // Analyze ±12.5 kHz window (25 kHz channel spacing)
+                val windowHalfSize = (12500 / frequencyResolution).toInt().coerceAtLeast(3)
+                val windowStart = (binIndex - windowHalfSize).coerceAtLeast(0)
+                val windowEnd = (binIndex + windowHalfSize).coerceAtMost(currentFFT.size - 1)
+
+                val windowData = currentFFT.sliceArray(windowStart..windowEnd)
+                val peakSignal = windowData.maxOrNull() ?: return null
+
+                peakSignal
+
+            } finally {
+                fftProcessorData.lock.readLock().unlock()
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error detecting air comm signal at frequency $targetFreq", e)
+            null
+        }
     }
 
     private fun startScanning() {

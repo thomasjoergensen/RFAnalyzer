@@ -90,6 +90,7 @@ fun MainScreen(analyzerSurface: AnalyzerSurface, viewModel: MainViewModel, appSt
             scanTabActions = viewModel.scanTabActions,
             iemPresetsTabActions = viewModel.iemPresetsTabActions,
             availableIEMPresets = availableIEMPresets,
+            airCommTabActions = viewModel.airCommTabActions,
             settingsTabActions = viewModel.settingsTabActions,
             aboutTabActions = viewModel.aboutTabActions,
         ) },
