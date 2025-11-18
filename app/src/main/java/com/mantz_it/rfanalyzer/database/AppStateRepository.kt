@@ -239,6 +239,8 @@ class AppStateRepository @Inject constructor(
     val recordingCurrentFileSize = MutableState(0L)
     val recordingStartedTimestamp = MutableState(0L)
     val recordingDirectoryUri = Setting("recordingDirectoryUri", "", scope, dataStore) // Empty = use internal storage, otherwise SAF content:// URI
+    val autoResumeRecording = Setting("autoResumeRecording", false, scope, dataStore) // Auto-start new recording when USB device reconnects
+    val wasRecordingBeforeDisconnect = MutableState(false) // Runtime flag to track if recording was active before USB disconnect
 
     // Scan Tab
     val scanStartFrequency = Setting("scanStartFrequency", 400000000L, scope, dataStore) // 400 MHz

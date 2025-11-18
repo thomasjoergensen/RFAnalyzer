@@ -199,6 +199,19 @@ class MainActivity: ComponentActivity() {
                         if (!appStateRepository.analyzerRunning.value)
                             appStateRepository.sourceType.set(SourceType.HYDRASDR)
                     }
+
+                    // Auto-resume recording if enabled and was recording before disconnect
+                    if (appStateRepository.autoResumeRecording.value && appStateRepository.wasRecordingBeforeDisconnect.value) {
+                        Log.i(TAG, "usbBroadcastReceiver:onReceive: Auto-resume enabled and was recording. Scheduling restart after 2s delay.")
+                        appStateRepository.wasRecordingBeforeDisconnect.set(false) // Reset flag
+
+                        // Schedule recording restart with 2 second delay
+                        // (ViewModel will handle starting analyzer if needed)
+                        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                            Log.i(TAG, "usbBroadcastReceiver: Calling restartRecordingAfterReconnect...")
+                            mainViewModel.restartRecordingAfterReconnect()
+                        }, 2000)
+                    }
                 }
             } else if(intent?.action == UsbManager.ACTION_USB_DEVICE_DETACHED) {
                 val device = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -213,6 +226,12 @@ class MainActivity: ComponentActivity() {
                     if (device.vendorId == 0x0bda && device.productId == 0x2838 && device.productName == "Blog V4") {
                         Log.i(TAG, "usbBroadcastReceiver:onReceive: RTL-SDR Blog V4 detached!")
                         appStateRepository.rtlsdrBlogV4connected.set(false)
+                    }
+
+                    // Track if recording was active before disconnect (for auto-resume feature)
+                    if (appStateRepository.recordingRunning.value) {
+                        Log.i(TAG, "usbBroadcastReceiver:onReceive: Recording was active during disconnect. Setting wasRecordingBeforeDisconnect flag.")
+                        appStateRepository.wasRecordingBeforeDisconnect.set(true)
                     }
                 }
             }
@@ -534,6 +553,9 @@ class MainActivity: ComponentActivity() {
                     is UiAction.ShowRecordingFinishedNotification -> {
                         showRecordingFinishedNotification(action.recordingName, action.sizeInBytes)
                     }
+                    is UiAction.ShowRecordingResumedNotification -> {
+                        showRecordingResumedNotification()
+                    }
                     null -> Log.e(TAG, "mainViewModel.uiActions.collect: action is NULL!")
                 }
             }
@@ -616,11 +638,13 @@ class MainActivity: ComponentActivity() {
             }
         }
 
-        // Handle incoming intent (when app was started by opening an .iq file with RF Analyzer
+        // Handle incoming intent (when app was started by opening an .iq file with RF Analyzer or USB device attached)
         if(intent != null) {
             Log.d(TAG, "onCreate: Incoming intent: action=${intent.action} categories=${intent.categories} data=${intent.data}")
             if("android.intent.action.VIEW" == intent.action && intent.data != null)
                 handleIncomingFile(intent)
+            else if(UsbManager.ACTION_USB_DEVICE_ATTACHED == intent.action)
+                handleUsbDeviceAttached(intent)
         }
     }
 
@@ -660,7 +684,10 @@ class MainActivity: ComponentActivity() {
     override fun onNewIntent(intent: Intent) {
         Log.d(TAG, "onNewIntent: received intent: action=${intent.action} categories=${intent.categories} data=${intent.data}")
         super.onNewIntent(intent)
-        handleIncomingFile(intent)
+        if("android.intent.action.VIEW" == intent.action && intent.data != null)
+            handleIncomingFile(intent)
+        else if(UsbManager.ACTION_USB_DEVICE_ATTACHED == intent.action)
+            handleUsbDeviceAttached(intent)
     }
 
     private fun handleIncomingFile(intent: Intent) {
@@ -683,6 +710,21 @@ class MainActivity: ComponentActivity() {
                 }
             } else
                 setFileSourceFromContentUri(uri)
+        }
+    }
+
+    private fun handleUsbDeviceAttached(intent: Intent) {
+        val device = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            intent.getParcelableExtra(UsbManager.EXTRA_DEVICE, UsbDevice::class.java)
+        } else {
+            @Suppress("DEPRECATION")
+            intent.getParcelableExtra<UsbDevice>(UsbManager.EXTRA_DEVICE)
+        }
+
+        device?.let {
+            Log.d(TAG, "handleUsbDeviceAttached: USB device attached via intent: ${it.deviceName} (vendor: ${it.vendorId}, product: ${it.productId})")
+            // The broadcast receiver will also handle this device, so we just log it here
+            // The actual device handling (setting source type, etc.) is done in the broadcast receiver
         }
     }
 
@@ -900,6 +942,31 @@ class MainActivity: ComponentActivity() {
 
         val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         notificationManager.notify(2, notification)  // Use ID 2 (ID 1 is for foreground service)
+    }
+
+    private fun showRecordingResumedNotification() {
+        Log.i(TAG, "showRecordingResumedNotification: Posting notification for recording resumed after USB reconnection")
+
+        // Intent to open the main screen when notification is tapped
+        val intent = Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+        }
+        val pendingIntent = PendingIntent.getActivity(
+            this, 0, intent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val notification = NotificationCompat.Builder(this, "RECORDING_CHANNEL")
+            .setSmallIcon(R.drawable.circle)  // Use a small icon
+            .setContentTitle("Recording Resumed")
+            .setContentText("Recording restarted after USB reconnection")
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setContentIntent(pendingIntent)
+            .setAutoCancel(true)  // Dismiss notification when tapped
+            .setVibrate(longArrayOf(0, 250, 250, 250))  // Vibration pattern: 250ms on, 250ms off, 250ms on
+            .build()
+
+        val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        notificationManager.notify(3, notification)  // Use ID 3 (ID 1 is for foreground service, ID 2 is for recording finished)
     }
 
 }

@@ -152,6 +152,7 @@ fun AnalyzerTabsComposable(
     val recordingCurrentFileSize by appStateRepository.recordingCurrentFileSize.stateFlow.collectAsState()
     val recordingStartedTimestamp by appStateRepository.recordingStartedTimestamp.stateFlow.collectAsState()
     val recordingDirectoryUri by appStateRepository.recordingDirectoryUri.stateFlow.collectAsState()
+    val autoResumeRecording by appStateRepository.autoResumeRecording.stateFlow.collectAsState()
     val scanRunning by appStateRepository.scanRunning.stateFlow.collectAsState()
     val scanProgress by appStateRepository.scanProgress.stateFlow.collectAsState()
     val currentScanFrequency by appStateRepository.currentScanFrequency.stateFlow.collectAsState()
@@ -321,6 +322,7 @@ fun AnalyzerTabsComposable(
                         recordingsTotalFileSize = totalRecordingSizeInBytes,
                         recordingStartedTimestamp = recordingStartedTimestamp,
                         recordingDirectoryUri = recordingDirectoryUri,
+                        autoResumeRecording = autoResumeRecording,
                         recordingTabActions = recordingTabActions
                     )
                 AnalyzerTabs.SCAN

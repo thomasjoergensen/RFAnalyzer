@@ -91,7 +91,8 @@ data class RecordingTabActions(
     val onStopAfterUnitChanged: (StopAfterUnit) -> Unit,
     val onStartRecordingClicked: () -> Unit,
     val onViewRecordingsClicked: () -> Unit,
-    val onChooseRecordingDirectoryClicked: () -> Unit
+    val onChooseRecordingDirectoryClicked: () -> Unit,
+    val onAutoResumeRecordingChanged: (Boolean) -> Unit
 )
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -113,6 +114,7 @@ fun RecordingTabComposable(
     recordingsTotalFileSize: Long,
     recordingStartedTimestamp: Long,
     recordingDirectoryUri: String,
+    autoResumeRecording: Boolean,
     recordingTabActions: RecordingTabActions
 ) {
     var currentTime by remember { mutableStateOf(System.currentTimeMillis()) }
@@ -228,6 +230,13 @@ fun RecordingTabComposable(
             enabled = !recordingRunning,
             helpSubPath = "recording.html#stop-recording-after",
             modifier = Modifier.fillMaxWidth()
+        )
+        OutlinedSwitch(
+            label = "Auto-resume recording on USB reconnection",
+            helpText = "Automatically start a new recording when USB device reconnects after disconnection during recording",
+            isChecked = autoResumeRecording,
+            onCheckedChange = recordingTabActions.onAutoResumeRecordingChanged,
+            enabled = !recordingRunning
         )
         Column(modifier = Modifier.fillMaxWidth()) {
             Text("Recordings occupy ${(recordingsTotalFileSize+currentRecordingFileSize).asSizeInBytesToString()} of Device Storage",
@@ -358,6 +367,7 @@ fun RecordingTabPreview() {
                 recordingsTotalFileSize = 0,
                 recordingStartedTimestamp = 0,
                 recordingDirectoryUri = "",
+                autoResumeRecording = false,
                 recordingTabActions = RecordingTabActions(
                     onNameChanged = { },
                     onOnlyRecordWhenSquelchIsSatisfiedChanged = { },
@@ -366,7 +376,8 @@ fun RecordingTabPreview() {
                     onStopAfterUnitChanged = { },
                     onStartRecordingClicked = { },
                     onViewRecordingsClicked = { },
-                    onChooseRecordingDirectoryClicked = { }
+                    onChooseRecordingDirectoryClicked = { },
+                    onAutoResumeRecordingChanged = { }
                 ),
             )
         }

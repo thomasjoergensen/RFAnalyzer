@@ -138,6 +138,7 @@ class MainViewModel @Inject constructor(
         data object ShowDonationDialog: UiAction()
         data object OnBuyFullVersionClicked: UiAction()
         data class ShowRecordingFinishedNotification(val recordingName: String, val sizeInBytes: Long): UiAction()
+        data object ShowRecordingResumedNotification: UiAction()
     }
     private fun sendActionToUi(uiAction: UiAction){ viewModelScope.launch { _uiActions.emit(uiAction) } }
 
@@ -228,6 +229,53 @@ class MainViewModel @Inject constructor(
             }
         ))
         Log.d(TAG, "showUsageTimeUsedUpDialog")
+    }
+
+    // Auto-resume recording after USB reconnection
+    fun restartRecordingAfterReconnect() {
+        Log.i(TAG, "restartRecordingAfterReconnect: Attempting to restart recording after USB reconnection")
+
+        // Check if already recording (shouldn't happen, but just in case)
+        if (appStateRepository.recordingRunning.value) {
+            Log.w(TAG, "restartRecordingAfterReconnect: Recording is already running. Ignoring auto-resume request.")
+            return
+        }
+
+        // Check if analyzer is running - recording requires active analyzer
+        if (!appStateRepository.analyzerRunning.value) {
+            Log.i(TAG, "restartRecordingAfterReconnect: Analyzer not running. Starting analyzer first...")
+
+            // Start the analyzer
+            sendActionToUi(UiAction.OnStartClicked)
+
+            // Wait for analyzer to start, then start recording
+            viewModelScope.launch {
+                // Wait for analyzer to be running (with timeout)
+                var waitTime = 0L
+                val maxWaitTime = 10000L // 10 seconds max
+                val checkInterval = 500L // Check every 500ms
+
+                while (!appStateRepository.analyzerRunning.value && waitTime < maxWaitTime) {
+                    kotlinx.coroutines.delay(checkInterval)
+                    waitTime += checkInterval
+                }
+
+                if (appStateRepository.analyzerRunning.value) {
+                    Log.i(TAG, "restartRecordingAfterReconnect: Analyzer started after ${waitTime}ms. Starting recording...")
+                    sendActionToUi(UiAction.OnStartRecordingClicked)
+                    sendActionToUi(UiAction.ShowRecordingResumedNotification)
+                } else {
+                    Log.e(TAG, "restartRecordingAfterReconnect: Analyzer failed to start after ${waitTime}ms. Cannot resume recording.")
+                    showSnackbar(SnackbarEvent("Cannot auto-resume: Analyzer failed to start"))
+                }
+            }
+            return
+        }
+
+        // Analyzer already running, start recording immediately
+        Log.i(TAG, "restartRecordingAfterReconnect: Analyzer already running. Starting recording...")
+        sendActionToUi(UiAction.OnStartRecordingClicked)
+        sendActionToUi(UiAction.ShowRecordingResumedNotification)
     }
 
     // ACTIONS
@@ -366,16 +414,40 @@ class MainViewModel @Inject constructor(
         onAirspyVgaGainChanged = appStateRepository.airspyVgaGain::set,
         onAirspyLnaGainChanged = appStateRepository.airspyLnaGain::set,
         onAirspyMixerGainChanged = appStateRepository.airspyMixerGain::set,
-        onAirspyLinearityGainChanged = appStateRepository.airspyLinearityGain::set,
-        onAirspySensitivityGainChanged = appStateRepository.airspySensitivityGain::set,
+        onAirspyLinearityGainChanged = { newGain ->
+            appStateRepository.airspyLinearityGain.set(newGain)
+            // Linearity and sensitivity gains are mutually exclusive - zero out the other
+            if (newGain > 0) {
+                appStateRepository.airspySensitivityGain.set(0)
+            }
+        },
+        onAirspySensitivityGainChanged = { newGain ->
+            appStateRepository.airspySensitivityGain.set(newGain)
+            // Linearity and sensitivity gains are mutually exclusive - zero out the other
+            if (newGain > 0) {
+                appStateRepository.airspyLinearityGain.set(0)
+            }
+        },
         onAirspyRfBiasEnabledChanged = appStateRepository.airspyRfBiasEnabled::set,
         onAirspyConverterOffsetChanged = appStateRepository.airspyConverterOffset::set,
         onHydraSdrAdvancedGainEnabledChanged = appStateRepository.hydraSdrAdvancedGainEnabled::set,
         onHydraSdrVgaGainChanged = appStateRepository.hydraSdrVgaGain::set,
         onHydraSdrLnaGainChanged = appStateRepository.hydraSdrLnaGain::set,
         onHydraSdrMixerGainChanged = appStateRepository.hydraSdrMixerGain::set,
-        onHydraSdrLinearityGainChanged = appStateRepository.hydraSdrLinearityGain::set,
-        onHydraSdrSensitivityGainChanged = appStateRepository.hydraSdrSensitivityGain::set,
+        onHydraSdrLinearityGainChanged = { newGain ->
+            appStateRepository.hydraSdrLinearityGain.set(newGain)
+            // Linearity and sensitivity gains are mutually exclusive - zero out the other
+            if (newGain > 0) {
+                appStateRepository.hydraSdrSensitivityGain.set(0)
+            }
+        },
+        onHydraSdrSensitivityGainChanged = { newGain ->
+            appStateRepository.hydraSdrSensitivityGain.set(newGain)
+            // Linearity and sensitivity gains are mutually exclusive - zero out the other
+            if (newGain > 0) {
+                appStateRepository.hydraSdrLinearityGain.set(0)
+            }
+        },
         onHydraSdrRfBiasEnabledChanged = appStateRepository.hydraSdrRfBiasEnabled::set,
         onHydraSdrRfPortChanged = appStateRepository.hydraSdrRfPort::set,
         onHydraSdrConverterOffsetChanged = appStateRepository.hydraSdrConverterOffset::set,
@@ -476,7 +548,8 @@ class MainViewModel @Inject constructor(
             }
         },
         onViewRecordingsClicked = { navigate(AppScreen.RecordingScreen) },
-        onChooseRecordingDirectoryClicked = { sendActionToUi(UiAction.OnChooseRecordingDirectoryClicked) }
+        onChooseRecordingDirectoryClicked = { sendActionToUi(UiAction.OnChooseRecordingDirectoryClicked) },
+        onAutoResumeRecordingChanged = appStateRepository.autoResumeRecording::set
     )
 
     // Scan Tab

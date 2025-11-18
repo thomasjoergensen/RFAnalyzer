@@ -362,6 +362,33 @@ class AnalyzerService : Service() {
             (source as RtlsdrSource).ifGain = appStateRepository.rtlsdrIFGainSteps.value[appStateRepository.rtlsdrIFGainIndex.value]
         }
 
+        // workaround for bug: when airspy is started, the gain values are not applied. so trigger re-application here
+        if (source is AirspySource) {
+            val airspySource = source as AirspySource
+            serviceScope.launch {
+                delay(100) // Wait for device to stabilize
+
+                // Re-apply gain settings - only apply the active gain to avoid conflicts
+                // (linearity and sensitivity gains are mutually exclusive, last one called wins)
+                if (appStateRepository.airspyAdvancedGainEnabled.value) {
+                    // Advanced gain mode - apply all three gains
+                    airspySource.lnaGain = appStateRepository.airspyLnaGain.value
+                    airspySource.mixerGain = appStateRepository.airspyMixerGain.value
+                    airspySource.vgaGain = appStateRepository.airspyVgaGain.value
+                    Log.i(TAG, "startAnalyzer: Re-applied Airspy advanced gains (LNA=${appStateRepository.airspyLnaGain.value}, Mixer=${appStateRepository.airspyMixerGain.value}, VGA=${appStateRepository.airspyVgaGain.value})")
+                } else {
+                    // Simple gain mode - only apply the non-zero gain (linearity or sensitivity)
+                    if (appStateRepository.airspyLinearityGain.value > 0) {
+                        airspySource.linearityGain = appStateRepository.airspyLinearityGain.value
+                        Log.i(TAG, "startAnalyzer: Re-applied Airspy linearity gain: ${appStateRepository.airspyLinearityGain.value}")
+                    } else {
+                        airspySource.sensitivityGain = appStateRepository.airspySensitivityGain.value
+                        Log.i(TAG, "startAnalyzer: Re-applied Airspy sensitivity gain: ${appStateRepository.airspySensitivityGain.value}")
+                    }
+                }
+            }
+        }
+
         return true
     }
 
