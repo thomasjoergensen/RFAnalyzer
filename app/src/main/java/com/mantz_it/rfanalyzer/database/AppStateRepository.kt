@@ -192,10 +192,18 @@ class AppStateRepository @Inject constructor(
     val filesourceRepeatEnabled = Setting("filesourceRepeatEnabled", false, scope, dataStore)
 
     // Multi-Device Management
+    enum class DeviceStatus {
+        CONNECTING,     // Device is being opened/initialized
+        CONNECTED,      // Device is running normally
+        ERROR           // Device failed to start or encountered an error
+    }
+
     data class DeviceInstance(
         val id: String,                      // Unique device identifier (e.g., "airspy_0", "airspy_1")
         val sourceType: SourceType,          // Type of SDR device
         val name: String,                    // Display name (e.g., "Airspy R2")
+        val status: DeviceStatus = DeviceStatus.CONNECTED,  // Current device status
+        val errorMessage: String? = null,    // Error message if status is ERROR
         val isRunning: Boolean = false,      // Is device currently streaming
         val isRecording: Boolean = false,    // Is device currently recording
         val frequency: Long = 97000000L,     // Current frequency
@@ -203,6 +211,7 @@ class AppStateRepository @Inject constructor(
     )
     val activeDevices = MutableStateFlow<List<DeviceInstance>>(emptyList())  // List of all active/running devices
     val activeDeviceId = MutableState<String?>(null)  // Currently selected device for display/demodulation
+    val scannedDevices = MutableStateFlow<List<com.mantz_it.rfanalyzer.analyzer.DeviceDescriptor>>(emptyList())  // List of available SDR devices from scan
     val availableDeviceTypes = MutableState<List<SourceType>>(SourceType.entries.filter { it != SourceType.FILESOURCE })  // Available device types for multi-device start
 
     // View Tab

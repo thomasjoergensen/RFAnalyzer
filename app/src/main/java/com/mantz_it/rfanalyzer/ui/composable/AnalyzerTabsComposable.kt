@@ -167,6 +167,7 @@ fun AnalyzerTabsComposable(
     // Multi-device state
     val activeDevices by appStateRepository.activeDevices.collectAsState()
     val activeDeviceId by appStateRepository.activeDeviceId.stateFlow.collectAsState()
+    val scannedDevices by appStateRepository.scannedDevices.collectAsState()
 
     Column {
         PrimaryScrollableTabRow(selectedTabIndex = state.ordinal) {
@@ -233,7 +234,10 @@ fun AnalyzerTabsComposable(
                         filesourceRepeatEnabled = filesourceRepeatEnabled,
                         sourceTabActions = sourceTabActions,
                         activeDevices = activeDevices,
-                        activeDeviceId = activeDeviceId
+                        activeDeviceId = activeDeviceId,
+                        scannedDevices = scannedDevices,
+                        onScanDevices = { mainViewModel.sendActionToUi(MainViewModel.UiAction.OnScanDevicesClicked) },
+                        onStartScannedDevice = { descriptor -> mainViewModel.sendActionToUi(MainViewModel.UiAction.OnStartScannedDeviceClicked(descriptor)) }
                     )
                 AnalyzerTabs.DISPLAY
                     -> DisplayTabComposable(

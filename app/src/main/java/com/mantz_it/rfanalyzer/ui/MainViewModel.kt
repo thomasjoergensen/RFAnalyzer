@@ -129,8 +129,12 @@ class MainViewModel @Inject constructor(
         data class OnStopDeviceClicked(val deviceId: String): UiAction()
         data class OnAddDeviceClicked(val sourceType: SourceType): UiAction()
         data class OnSelectDeviceForDisplay(val deviceId: String): UiAction()
+        data object OnScanDevicesClicked: UiAction()
+        data class OnStartScannedDeviceClicked(val descriptor: com.mantz_it.rfanalyzer.analyzer.DeviceDescriptor): UiAction()
+        data class OnStartRecordingDeviceClicked(val deviceId: String): UiAction()
+        data class OnStopRecordingDeviceClicked(val deviceId: String): UiAction()
     }
-    private fun sendActionToUi(uiAction: UiAction){ viewModelScope.launch { _uiActions.emit(uiAction) } }
+    internal fun sendActionToUi(uiAction: UiAction){ viewModelScope.launch { _uiActions.emit(uiAction) } }
 
     // Database
     val recordings: StateFlow<List<Recording>> = recordingDao.getAllRecordings().stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), initialValue = emptyList())
@@ -388,12 +392,10 @@ class MainViewModel @Inject constructor(
             sendActionToUi(UiAction.OnSelectDeviceForDisplay(deviceId))
         },
         onStartRecordingDeviceClicked = { deviceId ->
-            // Start recording for specific device (to be implemented in MainActivity)
-            Log.i(TAG, "onStartRecordingDeviceClicked: $deviceId")
+            sendActionToUi(UiAction.OnStartRecordingDeviceClicked(deviceId))
         },
         onStopRecordingDeviceClicked = { deviceId ->
-            // Stop recording for specific device (to be implemented in MainActivity)
-            Log.i(TAG, "onStopRecordingDeviceClicked: $deviceId")
+            sendActionToUi(UiAction.OnStopRecordingDeviceClicked(deviceId))
         },
     )
 
@@ -698,38 +700,48 @@ class MainViewModel @Inject constructor(
                                     Log.e(TAG, "RecordingFinished: Could not get directory DocumentFile from tree URI")
                                     fileRef.toString()
                                 } else {
-                                    // Find the ongoing_recording.iq file in the directory
-                                    val ongoingFile = docTree.findFile("ongoing_recording.iq")
+                                    // Get the filename from the URI and find it in the tree
+                                    // (Using tree allows us to rename, SingleDocumentFile doesn't support rename)
+                                    val tempFile = androidx.documentfile.provider.DocumentFile.fromSingleUri(context, fileRef)
+                                    val filename = tempFile?.name
 
-                                    if (ongoingFile == null) {
-                                        Log.e(TAG, "RecordingFinished: Could not find ongoing_recording.iq in directory")
+                                    if (filename == null) {
+                                        Log.e(TAG, "RecordingFinished: Could not extract filename from URI: $fileRef")
                                         fileRef.toString()
                                     } else {
-                                        val finalFilename = Recording(
-                                            name = appStateRepository.recordingName.value,
-                                            frequency = appStateRepository.sourceFrequency.value,
-                                            sampleRate = appStateRepository.sourceSampleRate.value,
-                                            date = appStateRepository.recordingStartedTimestamp.value,
-                                            fileFormat = when(appStateRepository.sourceType.value) {
-                                                SourceType.HACKRF -> FilesourceFileFormat.HACKRF
-                                                SourceType.RTLSDR -> FilesourceFileFormat.RTLSDR
-                                                SourceType.AIRSPY -> FilesourceFileFormat.AIRSPY
-                                                SourceType.HYDRASDR -> FilesourceFileFormat.HYDRASDR
-                                                SourceType.FILESOURCE -> appStateRepository.filesourceFileFormat.value
-                                            },
-                                            sizeInBytes = 0L,
-                                            filePath = "",
-                                            favorite = false
-                                        ).calculateFileName()
+                                        Log.d(TAG, "RecordingFinished: Looking for file '$filename' in directory")
+                                        val ongoingFile = docTree.findFile(filename)
 
-                                        val renamed = ongoingFile.renameTo(finalFilename)
-                                        if (renamed) {
-                                            Log.i(TAG, "RecordingFinished: Successfully renamed to $finalFilename")
-                                            // Return the new URI after rename
-                                            ongoingFile.uri.toString()
-                                        } else {
-                                            Log.e(TAG, "RecordingFinished: Failed to rename file to $finalFilename")
+                                        if (ongoingFile == null) {
+                                            Log.e(TAG, "RecordingFinished: Could not find file '$filename' in directory")
                                             fileRef.toString()
+                                        } else {
+                                            val finalFilename = Recording(
+                                                name = appStateRepository.recordingName.value,
+                                                frequency = appStateRepository.sourceFrequency.value,
+                                                sampleRate = appStateRepository.sourceSampleRate.value,
+                                                date = appStateRepository.recordingStartedTimestamp.value,
+                                                fileFormat = when(appStateRepository.sourceType.value) {
+                                                    SourceType.HACKRF -> FilesourceFileFormat.HACKRF
+                                                    SourceType.RTLSDR -> FilesourceFileFormat.RTLSDR
+                                                    SourceType.AIRSPY -> FilesourceFileFormat.AIRSPY
+                                                    SourceType.HYDRASDR -> FilesourceFileFormat.HYDRASDR
+                                                    SourceType.FILESOURCE -> appStateRepository.filesourceFileFormat.value
+                                                },
+                                                sizeInBytes = 0L,
+                                                filePath = "",
+                                                favorite = false
+                                            ).calculateFileName()
+
+                                            val renamed = ongoingFile.renameTo(finalFilename)
+                                            if (renamed) {
+                                                Log.i(TAG, "RecordingFinished: Successfully renamed '$filename' to '$finalFilename'")
+                                                // Return the new URI after rename
+                                                ongoingFile.uri.toString()
+                                            } else {
+                                                Log.e(TAG, "RecordingFinished: Failed to rename '$filename' to '$finalFilename'")
+                                                fileRef.toString()
+                                            }
                                         }
                                     }
                                 }

@@ -69,16 +69,30 @@ import kotlin.math.abs
  */
 
 /**
+ * Descriptor for an available SDR device (before starting)
+ */
+data class DeviceDescriptor(
+    val type: SourceType,                // Type of SDR device
+    val index: Int,                      // Device index (0, 1, 2...)
+    val usbDeviceName: String? = null,   // USB device name/path if available
+    val serialNumber: String? = null     // Serial number if available
+) {
+    val id: String get() = "${type.name.lowercase()}_$index"
+}
+
+/**
  * Represents a complete processing pipeline for a single SDR device
  */
 data class DevicePipeline(
-    val id: String,                      // Unique device identifier (e.g., "hackrf_0", "rtlsdr_1")
-    val sourceType: SourceType,          // Type of SDR device
+    val descriptor: DeviceDescriptor,    // Device descriptor
     val source: IQSourceInterface,       // IQ source instance
     val scheduler: Scheduler,            // Scheduler for this device
     val demodulator: Demodulator,        // Demodulator for this device
     val fftProcessor: FftProcessor       // FFT processor for this device
-)
+) {
+    val id: String get() = descriptor.id
+    val sourceType: SourceType get() = descriptor.type
+}
 
 @AndroidEntryPoint
 class AnalyzerService : Service() {
@@ -89,6 +103,10 @@ class AnalyzerService : Service() {
 
     // Multi-device support: Map of device ID to pipeline
     private val activePipelines = mutableMapOf<String, DevicePipeline>()
+
+    // Track device status and errors
+    private val deviceStatus = mutableMapOf<String, AppStateRepository.DeviceStatus>()
+    private val deviceErrors = mutableMapOf<String, String>()
 
     // Current active device for display/demodulation
     private var activeDeviceId: String? = null
@@ -126,8 +144,12 @@ class AnalyzerService : Service() {
                 val errorMessage = "Error with Source $deviceId (${source?.getName()}): $message"
                 Log.e(TAG, "onIQSourceError: $errorMessage")
                 serviceScope.launch {
+                    deviceStatus[deviceId] = AppStateRepository.DeviceStatus.ERROR
+                    deviceErrors[deviceId] = message ?: "Unknown error"
+                    syncActiveDevicesToRepository()
                     appStateRepository.emitAnalyzerEvent(AppStateRepository.AnalyzerEvent.SourceFailure("Device $deviceId: $message"))
-                    stopDevice(deviceId)
+                    // Note: Don't call stopDevice here as it will remove the error status
+                    // Let user manually remove the failed device
                 }
             }
         }
@@ -272,6 +294,9 @@ class AnalyzerService : Service() {
         activePipelines.clear()
         activeDeviceId = null
 
+        // Sync empty device list to repository
+        syncActiveDevicesToRepository()
+
         appStateRepository.sourceName.set("")
         appStateRepository.analyzerRunning.set(false)
         appStateRepository.analyzerStartPending.set(false)
@@ -297,8 +322,10 @@ class AnalyzerService : Service() {
     /**
      * Start a specific SDR device and create its processing pipeline
      */
-    fun startDevice(sourceType: SourceType, deviceId: String): Boolean {
-        Log.d(TAG, "startDevice: Starting device $deviceId of type $sourceType")
+    fun startDevice(descriptor: DeviceDescriptor): Boolean {
+        val deviceId = descriptor.id
+        Log.i(TAG, "startDevice: ========== Starting device $deviceId (${descriptor.type} #${descriptor.index}) ==========")
+        Log.i(TAG, "startDevice: Current active pipelines: ${activePipelines.keys}")
 
         // Check if device is already running
         if (activePipelines.containsKey(deviceId)) {
@@ -306,15 +333,33 @@ class AnalyzerService : Service() {
             return true
         }
 
-        // Create the source
-        val newSource = createSourceForType(sourceType, deviceId) ?: return false
+        // Set device status to CONNECTING
+        deviceStatus[deviceId] = AppStateRepository.DeviceStatus.CONNECTING
+        deviceErrors.remove(deviceId)
+        syncActiveDevicesToRepository()
 
-        // Open the source
-        if (!openSourceForDevice(newSource, deviceId, sourceType)) {
-            Toast.makeText(this, "Source not available ($deviceId - ${newSource.getName()})", Toast.LENGTH_LONG).show()
-            appStateRepository.analyzerStartPending.set(false)
+        // Create the source
+        val newSource = createSourceForType(descriptor)
+        if (newSource == null) {
+            deviceStatus[deviceId] = AppStateRepository.DeviceStatus.ERROR
+            deviceErrors[deviceId] = "Failed to create source"
+            syncActiveDevicesToRepository()
             return false
         }
+
+        // Open the source
+        if (!openSourceForDevice(newSource, descriptor)) {
+            val errorMsg = "Device not available or failed to open"
+            Toast.makeText(this, "$errorMsg ($deviceId - ${newSource.getName()})", Toast.LENGTH_LONG).show()
+            deviceStatus[deviceId] = AppStateRepository.DeviceStatus.ERROR
+            deviceErrors[deviceId] = errorMsg
+            appStateRepository.analyzerStartPending.set(false)
+            syncActiveDevicesToRepository()
+            return false
+        }
+
+        // Store descriptor for later use
+        tempDescriptors[deviceId] = descriptor
 
         // If source opened synchronously, start scheduler; otherwise callback will do it
         if (newSource.isOpen()) {
@@ -324,15 +369,32 @@ class AnalyzerService : Service() {
         return true // Waiting for onIQSourceReady callback
     }
 
+    // Legacy method for backwards compatibility
+    fun startDevice(sourceType: SourceType, deviceId: String): Boolean {
+        // Parse device ID to extract index
+        val index = deviceId.split("_").lastOrNull()?.toIntOrNull() ?: 0
+        val descriptor = DeviceDescriptor(sourceType, index)
+        return startDevice(descriptor)
+    }
+
     /**
      * Stop a specific device pipeline
      */
     fun stopDevice(deviceId: String) {
-        Log.d(TAG, "stopDevice: Stopping device $deviceId")
+        Log.i(TAG, "stopDevice: ========== Stopping device $deviceId ==========")
+        Log.i(TAG, "stopDevice: Current active pipelines before stop: ${activePipelines.keys}")
 
+        // Log stack trace to see what's calling this
+        Log.i(TAG, "stopDevice: Called from:", Exception("Stack trace"))
+
+        // Check if this device is recording - warn if stopping while recording
         val pipeline = activePipelines[deviceId] ?: run {
             Log.w(TAG, "stopDevice: Device $deviceId not found")
             return
+        }
+
+        if (pipeline.scheduler.isRecording) {
+            Log.w(TAG, "stopDevice: WARNING - Stopping device $deviceId while it is recording!")
         }
 
         // Stop the pipeline components
@@ -354,11 +416,18 @@ class AnalyzerService : Service() {
         // Remove from active pipelines
         activePipelines.remove(deviceId)
 
+        // Clean up status tracking
+        deviceStatus.remove(deviceId)
+        deviceErrors.remove(deviceId)
+
         // If this was the active device, clear it
         if (activeDeviceId == deviceId) {
             activeDeviceId = activePipelines.keys.firstOrNull()
             Log.d(TAG, "stopDevice: Active device was stopped. New active device: $activeDeviceId")
         }
+
+        // Sync active devices to repository for UI display
+        syncActiveDevicesToRepository()
 
         // If no more pipelines, stop analyzer
         if (activePipelines.isEmpty()) {
@@ -384,12 +453,139 @@ class AnalyzerService : Service() {
         appStateRepository.sourceName.set(pipeline.source.name)
         appStateRepository.sourceFrequency.set(pipeline.source.frequency)
         appStateRepository.sourceSampleRate.set(pipeline.source.sampleRate.toLong())
+
+        // Sync active device ID to repository for UI display
+        syncActiveDevicesToRepository()
     }
 
     /**
      * Get list of all active device IDs
      */
     fun getActiveDeviceIds(): List<String> = activePipelines.keys.toList()
+
+    /**
+     * Scan for available SDR devices connected via USB
+     */
+    fun scanForDevices(): List<DeviceDescriptor> {
+        val devices = mutableListOf<DeviceDescriptor>()
+        val usbManager = getSystemService(android.content.Context.USB_SERVICE) as? android.hardware.usb.UsbManager
+        if (usbManager == null) {
+            Log.w(TAG, "scanForDevices: USB Manager not available")
+            return devices
+        }
+
+        val usbDevices = usbManager.deviceList
+        Log.d(TAG, "scanForDevices: Found ${usbDevices.size} USB devices")
+
+        // Known SDR VID/PID combinations
+        val hackrfVidPid = listOf(0x1d50 to 0x6089)  // HackRF One
+        val rtlsdrVidPid = listOf(
+            0x0bda to 0x2832,  // Generic RTL2832U
+            0x0bda to 0x2838   // Generic RTL2832U
+        )
+        val airspyVidPid = listOf(
+            0x1d50 to 0x60a1   // Airspy
+        )
+        val hydraSdrVidPid = listOf(
+            0x1d50 to 0x60a1   // HydraSdr (uses same VID/PID as Airspy)
+        )
+
+        // Count devices by type
+        val hackrfCount = mutableMapOf<Int, Int>()
+        val rtlsdrCount = mutableMapOf<Int, Int>()
+        val airspyCount = mutableMapOf<Int, Int>()
+
+        for ((_, usbDevice) in usbDevices) {
+            val vid = usbDevice.vendorId
+            val pid = usbDevice.productId
+            val deviceName = usbDevice.deviceName
+            // Reading serial number requires USB permission - catch SecurityException
+            val serialNumber = try {
+                usbDevice.serialNumber
+            } catch (e: SecurityException) {
+                Log.d(TAG, "scanForDevices: No permission to read serial for $deviceName")
+                null
+            }
+
+            Log.d(TAG, "scanForDevices: Found USB device VID:$vid PID:$pid Name:$deviceName Serial:$serialNumber")
+
+            when {
+                hackrfVidPid.any { it.first == vid && it.second == pid } -> {
+                    val index = hackrfCount.size
+                    hackrfCount[index] = 1
+                    devices.add(DeviceDescriptor(SourceType.HACKRF, index, deviceName, serialNumber))
+                    Log.i(TAG, "scanForDevices: Found HackRF device #$index")
+                }
+                rtlsdrVidPid.any { it.first == vid && it.second == pid } -> {
+                    val index = rtlsdrCount.size
+                    rtlsdrCount[index] = 1
+                    devices.add(DeviceDescriptor(SourceType.RTLSDR, index, deviceName, serialNumber))
+                    Log.i(TAG, "scanForDevices: Found RTL-SDR device #$index")
+                }
+                airspyVidPid.any { it.first == vid && it.second == pid } -> {
+                    // Note: Airspy and HydraSdr share VID/PID, check product string if available
+                    val index = airspyCount.size
+                    airspyCount[index] = 1
+                    devices.add(DeviceDescriptor(SourceType.AIRSPY, index, deviceName, serialNumber))
+                    Log.i(TAG, "scanForDevices: Found Airspy device #$index")
+                }
+            }
+        }
+
+        Log.i(TAG, "scanForDevices: Found ${devices.size} SDR devices total")
+        return devices
+    }
+
+    /**
+     * Synchronize active pipelines to AppStateRepository for UI display
+     */
+    private fun syncActiveDevicesToRepository() {
+        // Include both active pipelines and devices with errors
+        val allDeviceIds = (activePipelines.keys + deviceStatus.keys).distinct()
+
+        val deviceInstances = allDeviceIds.mapNotNull { id ->
+            val pipeline = activePipelines[id]
+            val status = deviceStatus[id] ?: AppStateRepository.DeviceStatus.CONNECTED
+            val error = deviceErrors[id]
+
+            if (pipeline != null) {
+                // Active device
+                AppStateRepository.DeviceInstance(
+                    id = id,
+                    sourceType = pipeline.sourceType,
+                    name = pipeline.source.name,
+                    status = status,
+                    errorMessage = error,
+                    isRunning = true,
+                    isRecording = pipeline.scheduler.isRecording,
+                    frequency = pipeline.source.frequency,
+                    sampleRate = pipeline.source.sampleRate.toLong()
+                )
+            } else if (status == AppStateRepository.DeviceStatus.ERROR || status == AppStateRepository.DeviceStatus.CONNECTING) {
+                // Device in error or connecting state (not yet in activePipelines)
+                val sourceType = id.split("_").firstOrNull()?.uppercase()?.let {
+                    try { com.mantz_it.rfanalyzer.ui.composable.SourceType.valueOf(it) }
+                    catch (e: Exception) { com.mantz_it.rfanalyzer.ui.composable.SourceType.AIRSPY }
+                } ?: com.mantz_it.rfanalyzer.ui.composable.SourceType.AIRSPY
+
+                AppStateRepository.DeviceInstance(
+                    id = id,
+                    sourceType = sourceType,
+                    name = sourceType.displayName,
+                    status = status,
+                    errorMessage = error,
+                    isRunning = false,
+                    isRecording = false
+                )
+            } else {
+                null
+            }
+        }
+
+        appStateRepository.activeDevices.value = deviceInstances
+        appStateRepository.activeDeviceId.set(activeDeviceId)
+        Log.d(TAG, "syncActiveDevicesToRepository: Synced ${deviceInstances.size} devices (${deviceInstances.count { it.isRecording }} recording, ${deviceInstances.count { it.status == AppStateRepository.DeviceStatus.ERROR }} errors)")
+    }
 
     /**
      * Start scheduler for a specific device
@@ -461,10 +657,15 @@ class AnalyzerService : Service() {
         )
         newFftProcessor.start()
 
+        // Get descriptor from temporary storage
+        val descriptor = tempDescriptors[deviceId] ?: run {
+            Log.e(TAG, "startSchedulerForDevice: No descriptor found for $deviceId")
+            return false
+        }
+
         // Create pipeline and add to active pipelines
         val pipeline = DevicePipeline(
-            id = deviceId,
-            sourceType = tempSources_types[deviceId]!!,
+            descriptor = descriptor,
             source = tempSource,
             scheduler = newScheduler,
             demodulator = newDemodulator,
@@ -474,7 +675,7 @@ class AnalyzerService : Service() {
 
         // Remove from temporary storage
         tempSources.remove(deviceId)
-        tempSources_types.remove(deviceId)
+        tempDescriptors.remove(deviceId)
 
         // If this is the first device, make it active
         if (activeDeviceId == null) {
@@ -504,12 +705,20 @@ class AnalyzerService : Service() {
         }
 
         Log.i(TAG, "startSchedulerForDevice: Device $deviceId started successfully. Total active devices: ${activePipelines.size}")
+
+        // Set device status to CONNECTED
+        deviceStatus[deviceId] = AppStateRepository.DeviceStatus.CONNECTED
+        deviceErrors.remove(deviceId)
+
+        // Sync active devices to repository for UI display
+        syncActiveDevicesToRepository()
+
         return true
     }
 
     // Temporary storage for sources being initialized (before scheduler is started)
     private val tempSources = mutableMapOf<String, IQSourceInterface>()
-    private val tempSources_types = mutableMapOf<String, SourceType>()
+    private val tempDescriptors = mutableMapOf<String, DeviceDescriptor>()
 
     private fun startScheduler(): Boolean {
         // Legacy method - delegates to active device
@@ -563,10 +772,10 @@ class AnalyzerService : Service() {
     }
 
     /**
-     * Create an IQ Source instance for a specific device type and ID
+     * Create an IQ Source instance for a specific device descriptor
      */
-    private fun createSourceForType(sourceType: SourceType, deviceId: String): IQSourceInterface? {
-        val newSource: IQSourceInterface = when (sourceType) {
+    private fun createSourceForType(descriptor: DeviceDescriptor): IQSourceInterface? {
+        val newSource: IQSourceInterface = when (descriptor.type) {
             SourceType.FILESOURCE -> FileIQSource()
             SourceType.HACKRF -> {
                 val hackrfSource = HackrfSource()
@@ -605,8 +814,7 @@ class AnalyzerService : Service() {
                 rtlsdrSource
             }
             SourceType.AIRSPY -> {
-                val index = deviceId.split("_").lastOrNull()?.toIntOrNull() ?: 0
-                val airspySource = AirspySource(deviceIndex = index)
+                val airspySource = AirspySource(deviceIndex = descriptor.index)
                 airspySource.frequency = appStateRepository.sourceFrequency.value
                 airspySource.sampleRate = appStateRepository.sourceSampleRate.value.toInt()
                 airspySource.lnaGain = appStateRepository.airspyLnaGain.value
@@ -637,18 +845,17 @@ class AnalyzerService : Service() {
         }
 
         // Store in temporary map
-        tempSources[deviceId] = newSource
-        tempSources_types[deviceId] = sourceType
+        tempSources[descriptor.id] = newSource
         return newSource
     }
 
     /**
      * Open the IQ Source for a specific device
      */
-    private fun openSourceForDevice(source: IQSourceInterface, deviceId: String, sourceType: SourceType): Boolean {
-        val callback = createIQSourceCallback(deviceId)
+    private fun openSourceForDevice(source: IQSourceInterface, descriptor: DeviceDescriptor): Boolean {
+        val callback = createIQSourceCallback(descriptor.id)
 
-        return when (sourceType) {
+        return when (descriptor.type) {
             SourceType.FILESOURCE -> if (source is FileIQSource) {
                 source.init(
                     appStateRepository.filesourceUri.value.toUri(),
@@ -806,6 +1013,9 @@ class AnalyzerService : Service() {
         )
 
         Log.i(TAG, "startRecordingForDevice: Started recording for device $deviceId")
+
+        // Sync device list to update recording status in UI
+        syncActiveDevicesToRepository()
     }
 
     /**
@@ -845,6 +1055,9 @@ class AnalyzerService : Service() {
 
         pipeline.scheduler.stopRecording()
         Log.i(TAG, "stopRecordingForDevice: Stopped recording for device $deviceId")
+
+        // Sync device list to update recording status in UI
+        syncActiveDevicesToRepository()
     }
 
     /**

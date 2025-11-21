@@ -540,14 +540,14 @@ class MainActivity: ComponentActivity() {
                                 try { SourceType.valueOf(it) } catch (e: Exception) { null }
                             } ?: SourceType.AIRSPY
                             analyzerService?.startDevice(sourceType, action.deviceId)
-                            updateActiveDevicesList()
+                            // Device list automatically synced by service
                         }
                     }
                     is UiAction.OnStopDeviceClicked -> {
                         if (isBound) {
                             Log.i(TAG, "OnStopDeviceClicked: Stopping device ${action.deviceId}")
                             analyzerService?.stopDevice(action.deviceId)
-                            updateActiveDevicesList()
+                            // Device list automatically synced by service
                         }
                     }
                     is UiAction.OnAddDeviceClicked -> {
@@ -558,11 +558,7 @@ class MainActivity: ComponentActivity() {
                             val deviceId = "${action.sourceType.name.lowercase()}_$existingCount"
                             Log.i(TAG, "OnAddDeviceClicked: Adding device $deviceId of type ${action.sourceType}")
                             analyzerService?.startDevice(action.sourceType, deviceId)
-                            // Update device list after a short delay (allow device to start)
-                            lifecycleScope.launch {
-                                delay(500)
-                                updateActiveDevicesList()
-                            }
+                            // Device list automatically synced by service
                         }
                     }
                     is UiAction.OnSelectDeviceForDisplay -> {
@@ -570,6 +566,34 @@ class MainActivity: ComponentActivity() {
                             Log.i(TAG, "OnSelectDeviceForDisplay: Selecting device ${action.deviceId}")
                             analyzerService?.setActiveDevice(action.deviceId)
                             appStateRepository.activeDeviceId.set(action.deviceId)
+                        }
+                    }
+                    is UiAction.OnScanDevicesClicked -> {
+                        if (isBound) {
+                            Log.i(TAG, "OnScanDevicesClicked: Scanning for SDR devices")
+                            val scanned = analyzerService?.scanForDevices() ?: emptyList()
+                            lifecycleScope.launch {
+                                appStateRepository.scannedDevices.emit(scanned)
+                            }
+                            Log.i(TAG, "OnScanDevicesClicked: Found ${scanned.size} devices")
+                        }
+                    }
+                    is UiAction.OnStartScannedDeviceClicked -> {
+                        if (isBound) {
+                            Log.i(TAG, "OnStartScannedDeviceClicked: Starting device ${action.descriptor.id}")
+                            analyzerService?.startDevice(action.descriptor)
+                        }
+                    }
+                    is UiAction.OnStartRecordingDeviceClicked -> {
+                        if (isBound) {
+                            Log.i(TAG, "OnStartRecordingDeviceClicked: Starting recording for device ${action.deviceId}")
+                            analyzerService?.startRecordingForDevice(action.deviceId)
+                        }
+                    }
+                    is UiAction.OnStopRecordingDeviceClicked -> {
+                        if (isBound) {
+                            Log.i(TAG, "OnStopRecordingDeviceClicked: Stopping recording for device ${action.deviceId}")
+                            analyzerService?.stopRecordingForDevice(action.deviceId)
                         }
                     }
                     null -> Log.e(TAG, "mainViewModel.uiActions.collect: action is NULL!")
@@ -780,34 +804,6 @@ class MainActivity: ComponentActivity() {
         }
     }
 
-    private fun updateActiveDevicesList() {
-        if (!isBound) return
-
-        val deviceIds = analyzerService?.getActiveDeviceIds() ?: emptyList()
-        val devices = deviceIds.map { deviceId ->
-            val sourceType = deviceId.split("_").firstOrNull()?.uppercase()?.let {
-                try { SourceType.valueOf(it) } catch (e: Exception) { null }
-            } ?: SourceType.AIRSPY
-
-            AppStateRepository.DeviceInstance(
-                id = deviceId,
-                sourceType = sourceType,
-                name = sourceType.displayName,
-                isRunning = true,
-                isRecording = false,
-                frequency = 97000000L,
-                sampleRate = 10000000L
-            )
-        }
-
-        lifecycleScope.launch {
-            appStateRepository.activeDevices.emit(devices)
-            if (devices.isNotEmpty() && appStateRepository.activeDeviceId.value == null) {
-                appStateRepository.activeDeviceId.set(devices.first().id)
-            }
-        }
-        Log.d(TAG, "updateActiveDevicesList: Updated device list with ${devices.size} devices")
-    }
 
     private fun onOpenIQFileClicked() {
         // Show system file chooser

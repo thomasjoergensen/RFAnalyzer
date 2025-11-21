@@ -58,7 +58,8 @@ object AppModule {
             context,
             AppDatabase::class.java,
             "recordings_db"
-        ).build()
+        ).fallbackToDestructiveMigration()
+         .build()
     }
 
     @Provides

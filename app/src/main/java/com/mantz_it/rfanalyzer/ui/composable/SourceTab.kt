@@ -142,46 +142,130 @@ fun MultiDeviceSection(
 
         // List active devices
         activeDevices.forEach { device ->
-            androidx.compose.foundation.layout.Row(
+            androidx.compose.foundation.layout.Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(vertical = 4.dp),
-                verticalAlignment = Alignment.CenterVertically
+                    .padding(vertical = 4.dp)
             ) {
-                Text(
-                    text = "${device.name} (${device.id})",
-                    modifier = Modifier.weight(1f),
-                    color = if (device.id == activeDeviceId) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface
-                )
-                Button(
-                    onClick = { actions.onSelectDeviceForDisplay(device.id) },
-                    modifier = Modifier.padding(horizontal = 4.dp).height(32.dp),
-                    enabled = device.id != activeDeviceId
+                androidx.compose.foundation.layout.Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text("Select", fontSize = 10.sp)
-                }
-                Button(
-                    onClick = { actions.onStopDeviceClicked(device.id) },
-                    modifier = Modifier.height(32.dp)
-                ) {
-                    Text("Stop", fontSize = 10.sp)
+                    // Status indicator
+                    val statusColor = when (device.status) {
+                        com.mantz_it.rfanalyzer.database.AppStateRepository.DeviceStatus.CONNECTING -> Color.Yellow
+                        com.mantz_it.rfanalyzer.database.AppStateRepository.DeviceStatus.CONNECTED -> Color.Green
+                        com.mantz_it.rfanalyzer.database.AppStateRepository.DeviceStatus.ERROR -> Color.Red
+                    }
+                    androidx.compose.foundation.Canvas(
+                        modifier = Modifier
+                            .size(12.dp)
+                            .padding(end = 4.dp)
+                    ) {
+                        drawCircle(color = statusColor)
+                    }
+
+                    // Device name and recording indicator
+                    androidx.compose.foundation.layout.Column(
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Text(
+                            text = "${device.name} (${device.id})" + if (device.isRecording) " [REC]" else "",
+                            color = if (device.id == activeDeviceId) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface,
+                            fontWeight = if (device.id == activeDeviceId) androidx.compose.ui.text.font.FontWeight.Bold else androidx.compose.ui.text.font.FontWeight.Normal
+                        )
+                        if (device.status == com.mantz_it.rfanalyzer.database.AppStateRepository.DeviceStatus.ERROR && device.errorMessage != null) {
+                            Text(
+                                text = "Error: ${device.errorMessage}",
+                                fontSize = 10.sp,
+                                color = MaterialTheme.colorScheme.error,
+                                modifier = Modifier.padding(top = 2.dp)
+                            )
+                        }
+                    }
+
+                    // Select button (only for connected devices)
+                    if (device.status == com.mantz_it.rfanalyzer.database.AppStateRepository.DeviceStatus.CONNECTED) {
+                        Button(
+                            onClick = { actions.onSelectDeviceForDisplay(device.id) },
+                            modifier = Modifier.padding(horizontal = 4.dp).height(32.dp),
+                            enabled = device.id != activeDeviceId
+                        ) {
+                            Text("Select", fontSize = 10.sp)
+                        }
+                    }
+
+                    // Stop button
+                    Button(
+                        onClick = { actions.onStopDeviceClicked(device.id) },
+                        modifier = Modifier.height(32.dp)
+                    ) {
+                        Text("Stop", fontSize = 10.sp)
+                    }
                 }
             }
         }
 
-        // Add device button
+    }
+}
+
+/**
+ * Scanned devices section - shows available SDR hardware
+ */
+@Composable
+fun ScannedDevicesSection(
+    scannedDevices: List<com.mantz_it.rfanalyzer.analyzer.DeviceDescriptor>,
+    activeDeviceIds: List<String>,
+    onScanClicked: () -> Unit,
+    onStartDevice: (com.mantz_it.rfanalyzer.analyzer.DeviceDescriptor) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    androidx.compose.foundation.layout.Column(modifier = modifier.padding(8.dp)) {
         androidx.compose.foundation.layout.Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(top = 8.dp),
+            modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Text("Add Device:", modifier = Modifier.padding(end = 8.dp))
+            Text(
+                "Available Devices (${scannedDevices.size})",
+                style = MaterialTheme.typography.titleMedium,
+                modifier = Modifier.weight(1f)
+            )
             Button(
-                onClick = { actions.onAddDeviceClicked(SourceType.AIRSPY) },
+                onClick = onScanClicked,
                 modifier = Modifier.height(36.dp)
             ) {
-                Text("Airspy")
+                Text("Scan", fontSize = 12.sp)
+            }
+        }
+
+        if (scannedDevices.isEmpty()) {
+            Text(
+                "No devices found. Click 'Scan' to detect SDR hardware.",
+                fontSize = 12.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(vertical = 8.dp)
+            )
+        } else {
+            scannedDevices.forEach { device ->
+                androidx.compose.foundation.layout.Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "${device.type.displayName} #${device.index}",
+                        modifier = Modifier.weight(1f)
+                    )
+                    val isRunning = activeDeviceIds.contains(device.id)
+                    Button(
+                        onClick = { onStartDevice(device) },
+                        modifier = Modifier.height(32.dp),
+                        enabled = !isRunning
+                    ) {
+                        Text(if (isRunning) "Running" else "Start", fontSize = 10.sp)
+                    }
+                }
             }
         }
     }
@@ -243,9 +327,22 @@ fun SourceTabComposable(
     sourceTabActions: SourceTabActions,
     // Multi-device parameters
     activeDevices: List<com.mantz_it.rfanalyzer.database.AppStateRepository.DeviceInstance> = emptyList(),
-    activeDeviceId: String? = null
+    activeDeviceId: String? = null,
+    scannedDevices: List<com.mantz_it.rfanalyzer.analyzer.DeviceDescriptor> = emptyList(),
+    onScanDevices: () -> Unit = {},
+    onStartScannedDevice: (com.mantz_it.rfanalyzer.analyzer.DeviceDescriptor) -> Unit = {}
 ) {
     ScrollableColumnWithFadingEdge {
+        // Scanned devices section (always show for device discovery)
+        ScannedDevicesSection(
+            scannedDevices = scannedDevices,
+            activeDeviceIds = activeDevices.map { it.id },
+            onScanClicked = onScanDevices,
+            onStartDevice = onStartScannedDevice,
+            modifier = Modifier.fillMaxWidth()
+        )
+        androidx.compose.material3.HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
+
         // Multi-device section (show if any devices are active)
         if (activeDevices.isNotEmpty()) {
             MultiDeviceSection(
@@ -254,23 +351,6 @@ fun SourceTabComposable(
                 actions = sourceTabActions,
                 modifier = Modifier.fillMaxWidth()
             )
-            androidx.compose.material3.HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
-        } else {
-            // Show "Add Device" button even when no devices are active
-            androidx.compose.foundation.layout.Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(8.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text("Multi-Device Mode:", modifier = Modifier.padding(end = 8.dp))
-                Button(
-                    onClick = { sourceTabActions.onAddDeviceClicked(SourceType.AIRSPY) },
-                    modifier = Modifier.height(36.dp)
-                ) {
-                    Text("Add Airspy Device")
-                }
-            }
             androidx.compose.material3.HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
         }
 

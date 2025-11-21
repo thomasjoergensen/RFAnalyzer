@@ -37,10 +37,14 @@
 // ============================================================
 // Globals
 // ============================================================
+// JavaVM is process-wide and shared across all threads (keep as global)
 static JavaVM *g_vm = NULL;
-static jobject g_hydrasdrDeviceObj = NULL;
-static jmethodID g_getEmptyBufferMethod = NULL;
-static jmethodID g_onSamplesReadyMethod = NULL;
+
+// Thread-local storage for per-device state (allows multiple HydraSdr devices)
+// Each scheduler thread will have its own instance of these variables
+thread_local jobject g_hydrasdrDeviceObj = NULL;
+thread_local jmethodID g_getEmptyBufferMethod = NULL;
+thread_local jmethodID g_onSamplesReadyMethod = NULL;
 
 // ============================================================
 // JNI: Cache JavaVM

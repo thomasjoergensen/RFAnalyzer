@@ -3,6 +3,10 @@ cmake_minimum_required(VERSION 3.22.1)
 
 project("libairspy")
 
+# Enable C++11 for thread_local support
+set(CMAKE_CXX_STANDARD 11)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
 # Add the libusb module as a subdirectory
 # This tells CMake to process the CMakeLists.txt in the libusb module.
 add_subdirectory(../../../../libusb/src/main/cpp libusb_build_dir)
