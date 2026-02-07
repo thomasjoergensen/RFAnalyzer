@@ -92,7 +92,8 @@ data class RecordingTabActions(
     val onStartRecordingClicked: () -> Unit,
     val onViewRecordingsClicked: () -> Unit,
     val onChooseRecordingDirectoryClicked: () -> Unit,
-    val onAutoResumeRecordingChanged: (Boolean) -> Unit
+    val onAutoResumeRecordingChanged: (Boolean) -> Unit,
+    val onSplitAt4GBChanged: (Boolean) -> Unit
 )
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -115,6 +116,7 @@ fun RecordingTabComposable(
     recordingStartedTimestamp: Long,
     recordingDirectoryUri: String,
     autoResumeRecording: Boolean,
+    splitAt4GB: Boolean,
     recordingTabActions: RecordingTabActions
 ) {
     var currentTime by remember { mutableStateOf(System.currentTimeMillis()) }
@@ -237,6 +239,14 @@ fun RecordingTabComposable(
             isChecked = autoResumeRecording,
             onCheckedChange = recordingTabActions.onAutoResumeRecordingChanged,
             enabled = !recordingRunning
+        )
+        OutlinedSwitch(
+            label = "Split files at 4GB (FAT32 compatibility)",
+            helpText = "Automatically split recording into multiple files when reaching 4GB. Files are numbered sequentially (-001, -002, etc.) with gapless transitions.",
+            isChecked = splitAt4GB,
+            onCheckedChange = recordingTabActions.onSplitAt4GBChanged,
+            enabled = !recordingRunning,
+            helpSubPath = "recording.html#split-files"
         )
         Column(modifier = Modifier.fillMaxWidth()) {
             Text("Recordings occupy ${(recordingsTotalFileSize+currentRecordingFileSize).asSizeInBytesToString()} of Device Storage",
@@ -368,6 +378,7 @@ fun RecordingTabPreview() {
                 recordingStartedTimestamp = 0,
                 recordingDirectoryUri = "",
                 autoResumeRecording = false,
+                splitAt4GB = false,
                 recordingTabActions = RecordingTabActions(
                     onNameChanged = { },
                     onOnlyRecordWhenSquelchIsSatisfiedChanged = { },
@@ -377,7 +388,8 @@ fun RecordingTabPreview() {
                     onStartRecordingClicked = { },
                     onViewRecordingsClicked = { },
                     onChooseRecordingDirectoryClicked = { },
-                    onAutoResumeRecordingChanged = { }
+                    onAutoResumeRecordingChanged = { },
+                    onSplitAt4GBChanged = { }
                 ),
             )
         }

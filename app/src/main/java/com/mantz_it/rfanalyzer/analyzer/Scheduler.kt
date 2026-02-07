@@ -50,6 +50,7 @@ class Scheduler(var fftSize: Int, private val source: IQSourceInterface) : Threa
         private const val FFT_QUEUE_SIZE = 2
         private const val DEMOD_QUEUE_SIZE = 20
         private const val SQUELCH_DEBOUNCE_COUNT = 50  // number of loop iterations to wait before squelch goes from true to false
+        private const val FILE_SPLIT_SIZE_BYTES = 4_000_000_000L  // 4GB limit for FAT32 compatibility (slightly under 4GiB)
         private const val LOGTAG = "Scheduler"
     }
 
@@ -74,6 +75,12 @@ class Scheduler(var fftSize: Int, private val source: IQSourceInterface) : Threa
     private var onRecordingStopped: ((finalSize: Long) -> Unit)? = null     // callback when recording stops (with final file size in bytes)
     private var onFileSizeUpdate: ((currentFileSize: Long) -> Unit)? = null // periodical callback during recording to report file size (in bytes) to ui
     private var squelchDebounceCounter: Int = 0                             // helper counter to debounce squelch changes
+    // File splitting (for FAT32 compatibility)
+    private var splitAt4GB: Boolean = false                                 // Enable file splitting at 4GB boundary
+    private var currentFileIndex: Int = 1                                   // Current split file index (1, 2, 3, ...)
+    private var currentFileSize: Long = 0                                   // Size of current split file
+    private var totalRecordedSize: Long = 0                                 // Total size across all splits
+    private var onFileSplit: ((fileIndex: Int, fileSize: Long) -> BufferedOutputStream?)? = null // callback for file splits, returns new stream
 
     init {
         // allocate the buffer packets.
@@ -110,7 +117,9 @@ class Scheduler(var fftSize: Int, private val source: IQSourceInterface) : Threa
                        maxRecordingTime: Long? = null,                          // Maximum time to record (in milliseconds). null -> never stop
                        maxRecordingFileSize: Long? = null,                      // Maximum file size for the recording (in bytes). null -> never stop
                        onRecordingStopped: (finalSize: Long) -> Unit,           // callback when recording stops (with final file size in bytes)
-                       onFileSizeUpdate: (currentFileSize: Long) -> Unit) {     // periodical callback during recording to report file size (in bytes) to ui
+                       onFileSizeUpdate: (currentFileSize: Long) -> Unit,       // periodical callback during recording to report file size (in bytes) to ui
+                       splitAt4GB: Boolean = false,                             // Enable file splitting at 4GB for FAT32 compatibility
+                       onFileSplit: ((fileIndex: Int, fileSize: Long) -> BufferedOutputStream?)? = null) {  // callback for file splits
         stopRecording = false
         recordedFileSize = 0
         recordedStartTimestamp = System.currentTimeMillis()
@@ -120,7 +129,12 @@ class Scheduler(var fftSize: Int, private val source: IQSourceInterface) : Threa
         this.maxRecordingFileSize = maxRecordingFileSize
         this.onRecordingStopped = onRecordingStopped
         this.onFileSizeUpdate = onFileSizeUpdate
-        Log.i(LOGTAG, "startRecording: Recording started.")
+        this.splitAt4GB = splitAt4GB
+        this.onFileSplit = onFileSplit
+        this.currentFileIndex = 1
+        this.currentFileSize = 0
+        this.totalRecordedSize = 0
+        Log.i(LOGTAG, "startRecording: Recording started. (splitAt4GB=$splitAt4GB)")
     }
 
     override fun run() {
@@ -152,10 +166,42 @@ class Scheduler(var fftSize: Int, private val source: IQSourceInterface) : Threa
 
             ///// Recording ////////////////////////////////////////////////////////////////////////
             if (bufferedOutputStream != null) {
-                if(squelchSatisfied || !onlyWhenSquelchIsSatisfied || squelchDebounceCounter < SQUELCH_DEBOUNCE_COUNT) {
+                // Check if we need to split the file (gapless transition)
+                if (splitAt4GB && currentFileSize + packet.size >= FILE_SPLIT_SIZE_BYTES) {
+                    Log.i(LOGTAG, "run: File split triggered. Current file: $currentFileIndex, size: $currentFileSize bytes")
+                    try {
+                        // Flush and close current file
+                        bufferedOutputStream!!.flush()
+                        bufferedOutputStream!!.close()
+
+                        // Request new file from callback
+                        val nextFileIndex = currentFileIndex + 1
+                        val newStream = onFileSplit?.invoke(currentFileIndex, currentFileSize)
+
+                        if (newStream != null) {
+                            bufferedOutputStream = newStream
+                            totalRecordedSize += currentFileSize
+                            currentFileIndex = nextFileIndex
+                            currentFileSize = 0
+                            Log.i(LOGTAG, "run: File split successful. Now writing to file index: $currentFileIndex (total recorded: $totalRecordedSize bytes)")
+                        } else {
+                            Log.e(LOGTAG, "run: File split failed - callback returned null. Stopping recording.")
+                            bufferedOutputStream = null
+                            this.stopRecording()
+                        }
+                    } catch (e: IOException) {
+                        Log.e(LOGTAG, "run: Error during file split: ${e.message}")
+                        bufferedOutputStream = null
+                        this.stopRecording()
+                    }
+                }
+
+                if (bufferedOutputStream != null && (squelchSatisfied || !onlyWhenSquelchIsSatisfied || squelchDebounceCounter < SQUELCH_DEBOUNCE_COUNT)) {
                     try {
                         bufferedOutputStream!!.write(packet)
-                        recordedFileSize += packet.size.toLong()
+                        val packetSize = packet.size.toLong()
+                        currentFileSize += packetSize
+                        recordedFileSize += packetSize
                     } catch (e: IOException) {
                         Log.e(LOGTAG, "run: Error while writing to output stream (recording): " + e.message)
                         this.stopRecording()

@@ -549,7 +549,8 @@ class MainViewModel @Inject constructor(
         },
         onViewRecordingsClicked = { navigate(AppScreen.RecordingScreen) },
         onChooseRecordingDirectoryClicked = { sendActionToUi(UiAction.OnChooseRecordingDirectoryClicked) },
-        onAutoResumeRecordingChanged = appStateRepository.autoResumeRecording::set
+        onAutoResumeRecordingChanged = appStateRepository.autoResumeRecording::set,
+        onSplitAt4GBChanged = appStateRepository.recordingSplitAt4GB::set
     )
 
     // Scan Tab
@@ -1797,63 +1798,23 @@ class MainViewModel @Inject constructor(
             appStateRepository.analyzerEvents.collect { event ->
                 when (event) {
                     is AppStateRepository.AnalyzerEvent.RecordingFinished -> {
-                        // Handle both File (internal storage) and Uri (SAF) references
                         val fileRef = event.recordingFileRef
                         val customDirUri = appStateRepository.recordingDirectoryUri.value
 
-                        val finalFilePath: String = if (fileRef is android.net.Uri) {
-                            // SAF file - rename it using the tree URI
-                            try {
-                                // Get the tree URI (directory) from settings
-                                val treeUri = android.net.Uri.parse(customDirUri)
-                                val docTree = androidx.documentfile.provider.DocumentFile.fromTreeUri(context, treeUri)
+                        // Check if this is a split recording (list of files) or single file
+                        val isSplitRecording = fileRef is List<*>
+                        val fileRefs = if (isSplitRecording) {
+                            @Suppress("UNCHECKED_CAST")
+                            fileRef as List<Any>
+                        } else {
+                            listOf(fileRef)
+                        }
 
-                                if (docTree == null) {
-                                    Log.e(TAG, "RecordingFinished: Could not get directory DocumentFile from tree URI")
-                                    fileRef.toString()
-                                } else {
-                                    // Find the ongoing_recording.iq file in the directory
-                                    val ongoingFile = docTree.findFile("ongoing_recording.iq")
+                        Log.i(TAG, "RecordingFinished: Processing ${fileRefs.size} file(s), split=$isSplitRecording")
 
-                                    if (ongoingFile == null) {
-                                        Log.e(TAG, "RecordingFinished: Could not find ongoing_recording.iq in directory")
-                                        fileRef.toString()
-                                    } else {
-                                        val finalFilename = Recording(
-                                            name = appStateRepository.recordingName.value,
-                                            frequency = appStateRepository.sourceFrequency.value,
-                                            sampleRate = appStateRepository.sourceSampleRate.value,
-                                            date = appStateRepository.recordingStartedTimestamp.value,
-                                            fileFormat = when(appStateRepository.sourceType.value) {
-                                                SourceType.HACKRF -> FilesourceFileFormat.HACKRF
-                                                SourceType.RTLSDR -> FilesourceFileFormat.RTLSDR
-                                                SourceType.AIRSPY -> FilesourceFileFormat.AIRSPY
-                                                SourceType.HYDRASDR -> FilesourceFileFormat.HYDRASDR
-                                                SourceType.FILESOURCE -> appStateRepository.filesourceFileFormat.value
-                                            },
-                                            sizeInBytes = 0L,
-                                            filePath = "",
-                                            favorite = false
-                                        ).calculateFileName()
-
-                                        val renamed = ongoingFile.renameTo(finalFilename)
-                                        if (renamed) {
-                                            Log.i(TAG, "RecordingFinished: Successfully renamed to $finalFilename")
-                                            // Return the new URI after rename
-                                            ongoingFile.uri.toString()
-                                        } else {
-                                            Log.e(TAG, "RecordingFinished: Failed to rename file to $finalFilename")
-                                            fileRef.toString()
-                                        }
-                                    }
-                                }
-                            } catch (e: Exception) {
-                                Log.e(TAG, "RecordingFinished: Exception while renaming SAF file: ${e.message}", e)
-                                fileRef.toString()
-                            }
-                        } else if (fileRef is File) {
-                            // Internal storage file - rename as before
-                            val newRecording = Recording(
+                        // Helper function to generate final filename with optional split suffix
+                        fun generateFinalFilename(splitIndex: Int?): String {
+                            val baseName = Recording(
                                 name = appStateRepository.recordingName.value,
                                 frequency = appStateRepository.sourceFrequency.value,
                                 sampleRate = appStateRepository.sourceSampleRate.value,
@@ -1868,48 +1829,137 @@ class MainViewModel @Inject constructor(
                                 sizeInBytes = 0L,
                                 filePath = "",
                                 favorite = false
-                            )
-                            sendActionToUi(UiAction.RenameFile(fileRef, newRecording.calculateFileName()))
-                            "${fileRef.parent}/${newRecording.calculateFileName()}"
-                        } else {
-                            Log.e(TAG, "RecordingFinished: Unknown file reference type: ${fileRef.javaClass.name}")
-                            ""
+                            ).calculateFileName()
+
+                            return if (splitIndex != null) {
+                                // Insert split suffix before .iq extension
+                                baseName.replace(".iq", "-${String.format("%03d", splitIndex)}.iq")
+                            } else {
+                                baseName
+                            }
                         }
 
-                        val newRecording = Recording(
-                            name = appStateRepository.recordingName.value,
-                            frequency = appStateRepository.sourceFrequency.value,
-                            sampleRate = appStateRepository.sourceSampleRate.value,
-                            date = appStateRepository.recordingStartedTimestamp.value,
-                            fileFormat = when(appStateRepository.sourceType.value) {
-                                SourceType.HACKRF -> FilesourceFileFormat.HACKRF
-                                SourceType.RTLSDR -> FilesourceFileFormat.RTLSDR
-                                SourceType.AIRSPY -> FilesourceFileFormat.AIRSPY
-                                SourceType.HYDRASDR -> FilesourceFileFormat.HYDRASDR
-                                SourceType.FILESOURCE -> appStateRepository.filesourceFileFormat.value
-                            },
-                            sizeInBytes = event.finalSize,
-                            filePath = finalFilePath,
-                            favorite = false
-                        )
+                        // Process each file and collect final paths
+                        val finalFilePaths = mutableListOf<Pair<String, Long>>()
+                        fileRefs.forEachIndexed { index, singleFileRef ->
+                            val splitIndex = if (isSplitRecording) index + 1 else null
+                            val finalFilename = generateFinalFilename(splitIndex)
 
-                        insertRecording(newRecording) { insertedRecording ->
-                            appStateRepository.recordingStartedTimestamp.set(0L)
-                            appStateRepository.recordingRunning.set(false)
+                            val finalFilePath: String = if (singleFileRef is android.net.Uri) {
+                                // SAF file - rename it using the tree URI
+                                try {
+                                    val treeUri = android.net.Uri.parse(customDirUri)
+                                    val docTree = androidx.documentfile.provider.DocumentFile.fromTreeUri(context, treeUri)
 
-                            // Show notification for smartwatch/wearables
-                            sendActionToUi(UiAction.ShowRecordingFinishedNotification(
-                                insertedRecording.name,
-                                insertedRecording.sizeInBytes
-                            ))
+                                    if (docTree == null) {
+                                        Log.e(TAG, "RecordingFinished: Could not get directory DocumentFile from tree URI")
+                                        singleFileRef.toString()
+                                    } else {
+                                        // Find the temporary file in the directory
+                                        val tempFilename = if (isSplitRecording) {
+                                            "ongoing_recording_${String.format("%03d", index + 1)}.iq"
+                                        } else {
+                                            "ongoing_recording.iq"
+                                        }
+                                        val ongoingFile = docTree.findFile(tempFilename)
 
-                            showSnackbar(SnackbarEvent(
-                                message = "Recording '${insertedRecording.name}' finished (${insertedRecording.sizeInBytes.asSizeInBytesToString()})",
-                                buttonText = "Delete Recording",
-                                callback = { askDeletionResult ->
-                                    if(askDeletionResult == SnackbarResult.ActionPerformed) deleteRecordingWithUndo(insertedRecording)
+                                        if (ongoingFile == null) {
+                                            Log.e(TAG, "RecordingFinished: Could not find $tempFilename in directory")
+                                            singleFileRef.toString()
+                                        } else {
+                                            val renamed = ongoingFile.renameTo(finalFilename)
+                                            if (renamed) {
+                                                Log.i(TAG, "RecordingFinished: Successfully renamed $tempFilename to $finalFilename")
+                                                ongoingFile.uri.toString()
+                                            } else {
+                                                Log.e(TAG, "RecordingFinished: Failed to rename $tempFilename to $finalFilename")
+                                                singleFileRef.toString()
+                                            }
+                                        }
+                                    }
+                                } catch (e: Exception) {
+                                    Log.e(TAG, "RecordingFinished: Exception while renaming SAF file: ${e.message}", e)
+                                    singleFileRef.toString()
                                 }
-                            ))
+                            } else if (singleFileRef is File) {
+                                // Internal storage file - rename
+                                sendActionToUi(UiAction.RenameFile(singleFileRef, finalFilename))
+                                "${singleFileRef.parent}/$finalFilename"
+                            } else {
+                                Log.e(TAG, "RecordingFinished: Unknown file reference type: ${singleFileRef.javaClass.name}")
+                                ""
+                            }
+
+                            // Get file size from SAF URI or File
+                            val fileSize = if (singleFileRef is android.net.Uri) {
+                                try {
+                                    val treeUri = android.net.Uri.parse(customDirUri)
+                                    val docTree = androidx.documentfile.provider.DocumentFile.fromTreeUri(context, treeUri)
+                                    docTree?.findFile(finalFilename)?.length() ?: 0L
+                                } catch (e: Exception) {
+                                    0L
+                                }
+                            } else if (singleFileRef is File) {
+                                File(singleFileRef.parent, finalFilename).length()
+                            } else {
+                                0L
+                            }
+
+                            finalFilePaths.add(Pair(finalFilePath, fileSize))
+                        }
+
+                        // Insert all recordings into database
+                        val totalSize = finalFilePaths.sumOf { it.second }
+                        finalFilePaths.forEachIndexed { index, (filePath, fileSize) ->
+                            val recording = Recording(
+                                name = appStateRepository.recordingName.value,
+                                frequency = appStateRepository.sourceFrequency.value,
+                                sampleRate = appStateRepository.sourceSampleRate.value,
+                                date = appStateRepository.recordingStartedTimestamp.value,
+                                fileFormat = when(appStateRepository.sourceType.value) {
+                                    SourceType.HACKRF -> FilesourceFileFormat.HACKRF
+                                    SourceType.RTLSDR -> FilesourceFileFormat.RTLSDR
+                                    SourceType.AIRSPY -> FilesourceFileFormat.AIRSPY
+                                    SourceType.HYDRASDR -> FilesourceFileFormat.HYDRASDR
+                                    SourceType.FILESOURCE -> appStateRepository.filesourceFileFormat.value
+                                },
+                                sizeInBytes = fileSize,
+                                filePath = filePath,
+                                favorite = false
+                            )
+
+                            insertRecording(recording) { insertedRecording ->
+                                // Only show notification and snackbar for the last file
+                                if (index == finalFilePaths.size - 1) {
+                                    appStateRepository.recordingStartedTimestamp.set(0L)
+                                    appStateRepository.recordingRunning.set(false)
+
+                                    val message = if (isSplitRecording) {
+                                        "Recording '${insertedRecording.name}' finished (${finalFilePaths.size} files, ${totalSize.asSizeInBytesToString()} total)"
+                                    } else {
+                                        "Recording '${insertedRecording.name}' finished (${totalSize.asSizeInBytesToString()})"
+                                    }
+
+                                    sendActionToUi(UiAction.ShowRecordingFinishedNotification(
+                                        insertedRecording.name,
+                                        totalSize
+                                    ))
+
+                                    showSnackbar(SnackbarEvent(
+                                        message = message,
+                                        buttonText = if (isSplitRecording) "View" else "Delete Recording",
+                                        callback = { result ->
+                                            if(result == SnackbarResult.ActionPerformed) {
+                                                if (isSplitRecording) {
+                                                    navigate(AppScreen.RecordingScreen)
+                                                } else {
+                                                    deleteRecordingWithUndo(insertedRecording)
+                                                }
+                                            }
+                                        }
+                                    ))
+                                }
+                            }
                         }
                     }
                     is AppStateRepository.AnalyzerEvent.SourceFailure ->
