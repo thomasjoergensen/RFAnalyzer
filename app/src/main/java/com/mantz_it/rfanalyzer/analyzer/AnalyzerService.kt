@@ -1,6 +1,7 @@
 package com.mantz_it.rfanalyzer.analyzer
 
 import android.app.Notification
+import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
@@ -88,6 +89,7 @@ class AnalyzerService : Service() {
     private var recordingSplitFiles = mutableListOf<Any>() // List of file references (File or Uri) for split recording
     private var recordingUsingSAF = false // Whether current recording uses Storage Access Framework
     private var recordingDirectory: Any? = null // DocumentFile or File representing recording directory
+    private var recordingNotificationJob: Job? = null // Coroutine for periodic notification updates
 
     inner class LocalBinder : Binder() {
         fun getService(): AnalyzerService = this@AnalyzerService
@@ -96,6 +98,8 @@ class AnalyzerService : Service() {
     companion object {
         private const val TAG = "AnalyzerService"
         const val ACTION_STOP = "com.mantz_it.rfanalyzer.analyzer.ACTION_STOP"
+        const val ACTION_STOP_RECORDING = "com.mantz_it.rfanalyzer.analyzer.ACTION_STOP_RECORDING"
+        const val RECORDING_NOTIFICATION_ID = 4
     }
 
     private val iqSourceActions: IQSourceInterface.Callback = object : IQSourceInterface.Callback {
@@ -159,6 +163,11 @@ class AnalyzerService : Service() {
                 if(!isBound)
                     stopSelf() // Stop the service if activity is not connected
                 return START_NOT_STICKY // Ensure the service is not restarted automatically
+            }
+            ACTION_STOP_RECORDING -> {
+                Log.d(TAG, "onStartCommand: Stop Recording action received (e.g. from watch notification).")
+                stopRecording()
+                return START_STICKY
             }
             else -> {
                 // This handles the case where the service is started by the activity or any other intent
@@ -226,6 +235,7 @@ class AnalyzerService : Service() {
      */
     fun stopAnalyzer() {
         Log.i(TAG, "stopAnalyzer")
+        cancelRecordingNotification()
         // Stop the Scheduler if running:
         scheduler?.stopScheduler()
 
@@ -749,10 +759,110 @@ class AnalyzerService : Service() {
         // update ui
         appStateRepository.recordingStartedTimestamp.set(recordingStartedTimestamp)
         appStateRepository.recordingRunning.set(true)
+
+        // Show ongoing notification (mirrored to paired Wear OS watch)
+        showRecordingOngoingNotification()
+        startRecordingNotificationUpdater()
     }
 
     fun stopRecording() {
+        cancelRecordingNotification()
         scheduler?.stopRecording()
+    }
+
+    // ---- Recording ongoing notification (mirrored to Pixel Watch via Wear OS) ----
+
+    /**
+     * Shows an ongoing notification with recording status.
+     * Automatically mirrored to paired Wear OS watches (e.g. Pixel Watch 4).
+     * Uses a chronometer for live elapsed time and includes a "Stop Recording" action.
+     */
+    private fun showRecordingOngoingNotification() {
+        val notification = buildRecordingNotification(appStateRepository.recordingCurrentFileSize.value)
+        val notificationManager = getSystemService(NotificationManager::class.java)
+        notificationManager.notify(RECORDING_NOTIFICATION_ID, notification)
+    }
+
+    private fun updateRecordingNotification(currentFileSize: Long) {
+        val notification = buildRecordingNotification(currentFileSize)
+        val notificationManager = getSystemService(NotificationManager::class.java)
+        notificationManager.notify(RECORDING_NOTIFICATION_ID, notification)
+    }
+
+    private fun buildRecordingNotification(currentFileSize: Long): Notification {
+        val frequency = appStateRepository.sourceFrequency.value
+        val sampleRate = appStateRepository.sourceSampleRate.value
+
+        val freqStr = formatFrequencyForNotification(frequency)
+        val bwStr = formatFrequencyForNotification(sampleRate)
+        val contentText = if (currentFileSize > 0)
+            "$freqStr  |  BW: $bwStr  |  ${formatFileSizeForNotification(currentFileSize)}"
+        else
+            "$freqStr  |  BW: $bwStr"
+
+        val activityIntent = Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+        }
+        val activityPendingIntent = PendingIntent.getActivity(
+            this, 1, activityIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val stopRecordingIntent = Intent(this, AnalyzerService::class.java).apply {
+            action = ACTION_STOP_RECORDING
+        }
+        val pendingStopRecordingIntent = PendingIntent.getService(
+            this, 1, stopRecordingIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        return NotificationCompat.Builder(this, "RECORDING_CHANNEL")
+            .setContentTitle("Recording in progress")
+            .setContentText(contentText)
+            .setSmallIcon(R.drawable.circle)
+            .setContentIntent(activityPendingIntent)
+            .addAction(R.drawable.stop_circle, "Stop Recording", pendingStopRecordingIntent)
+            .setUsesChronometer(true)
+            .setWhen(appStateRepository.recordingStartedTimestamp.value)
+            .setOnlyAlertOnce(true)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setCategory(NotificationCompat.CATEGORY_PROGRESS)
+            .build()
+    }
+
+    private fun cancelRecordingNotification() {
+        recordingNotificationJob?.cancel()
+        recordingNotificationJob = null
+        val notificationManager = getSystemService(NotificationManager::class.java)
+        notificationManager.cancel(RECORDING_NOTIFICATION_ID)
+    }
+
+    private fun startRecordingNotificationUpdater() {
+        recordingNotificationJob?.cancel()
+        recordingNotificationJob = serviceScope.launch {
+            while (appStateRepository.recordingRunning.value) {
+                delay(5000)
+                if (appStateRepository.recordingRunning.value) {
+                    updateRecordingNotification(appStateRepository.recordingCurrentFileSize.value)
+                }
+            }
+        }
+    }
+
+    private fun formatFrequencyForNotification(freq: Long): String {
+        return when {
+            freq >= 1_000_000_000L -> "%.3f GHz".format(freq / 1_000_000_000.0)
+            freq >= 1_000_000L -> "%.3f MHz".format(freq / 1_000_000.0)
+            freq >= 1_000L -> "%.1f kHz".format(freq / 1_000.0)
+            else -> "$freq Hz"
+        }
+    }
+
+    private fun formatFileSizeForNotification(bytes: Long): String {
+        return when {
+            bytes >= 1024L * 1024L * 1024L -> "%.1f GB".format(bytes / (1024.0 * 1024.0 * 1024.0))
+            bytes >= 1024L * 1024L -> "${bytes / (1024 * 1024)} MB"
+            bytes >= 1024L -> "${bytes / 1024} KB"
+            else -> "$bytes B"
+        }
     }
 
     private fun handleAppStateChanges() {
@@ -812,6 +922,11 @@ class AnalyzerService : Service() {
         s.collectAppState(asr.channelWidth) { demodulator?.channelWidth = it }
         s.collectAppState(asr.squelchSatisfied) { scheduler?.squelchSatisfied = it }
         s.collectAppState(asr.effectiveAudioVolumeLevel) { demodulator?.audioVolumeLevel = it }
+
+        // recording notification (cancel when recording stops, e.g. auto-stop by max time/size)
+        s.collectAppState(asr.recordingRunning) { isRecording ->
+            if (!isRecording) cancelRecordingNotification()
+        }
 
         // settings tab
         s.collectAppState(asr.loggingEnabled) {

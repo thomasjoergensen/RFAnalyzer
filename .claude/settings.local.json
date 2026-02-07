@@ -1,7 +1,10 @@
 {
   "permissions": {
     "allow": [
-      "WebSearch"
+      "WebSearch",
+      "Bash(./gradlew assembleFossDebug:*)",
+      "Bash(bash gradlew:*)",
+      "Bash(bash:*)"
     ],
     "deny": [],
     "ask": []
