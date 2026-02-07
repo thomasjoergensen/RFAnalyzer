@@ -1,6 +1,7 @@
 package com.mantz_it.rfanalyzer.ui
 
 import android.app.Activity
+import android.content.Context
 import android.net.Uri
 import android.os.Build
 import android.util.Log
@@ -12,8 +13,15 @@ import com.mantz_it.rfanalyzer.database.AppStateRepository
 import com.mantz_it.rfanalyzer.database.AppStateRepository.Companion.DEFAULT_VERTICAL_SCALE_MAX
 import com.mantz_it.rfanalyzer.database.AppStateRepository.Companion.DEFAULT_VERTICAL_SCALE_MIN
 import com.mantz_it.rfanalyzer.database.BillingRepositoryInterface
+import com.mantz_it.rfanalyzer.database.DiscoveredSignal
 import com.mantz_it.rfanalyzer.database.Recording
 import com.mantz_it.rfanalyzer.database.RecordingDao
+import com.mantz_it.rfanalyzer.database.IEMDao
+import com.mantz_it.rfanalyzer.database.IEMDetectedChannel
+import com.mantz_it.rfanalyzer.database.IEMDetectedChannelInfo
+import com.mantz_it.rfanalyzer.database.IEMScanResult
+import com.mantz_it.rfanalyzer.database.ScanDao
+import com.mantz_it.rfanalyzer.database.ScanResult
 import com.mantz_it.rfanalyzer.database.calculateFileName
 import com.mantz_it.rfanalyzer.database.collectAppState
 import com.mantz_it.rfanalyzer.source.AirspySource
@@ -24,7 +32,11 @@ import com.mantz_it.rfanalyzer.ui.composable.DemodulationMode
 import com.mantz_it.rfanalyzer.ui.composable.DemodulationTabActions
 import com.mantz_it.rfanalyzer.ui.composable.DisplayTabActions
 import com.mantz_it.rfanalyzer.ui.composable.FilesourceFileFormat
+import com.mantz_it.rfanalyzer.ui.composable.AirCommTabActions
 import com.mantz_it.rfanalyzer.ui.composable.RecordingTabActions
+import com.mantz_it.rfanalyzer.ui.composable.ScanDetectionMode
+import com.mantz_it.rfanalyzer.ui.composable.IEMPresetsTabActions
+import com.mantz_it.rfanalyzer.ui.composable.ScanTabActions
 import com.mantz_it.rfanalyzer.ui.composable.SettingsTabActions
 import com.mantz_it.rfanalyzer.ui.composable.SourceTabActions
 import com.mantz_it.rfanalyzer.ui.composable.SourceType
@@ -33,6 +45,8 @@ import com.mantz_it.rfanalyzer.ui.composable.asStringWithUnit
 import com.mantz_it.rfanalyzer.ui.composable.saturationFunction
 import com.mantz_it.rfanalyzer.ui.screens.RecordingScreenActions
 import dagger.hilt.android.lifecycle.HiltViewModel
+import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -88,8 +102,11 @@ sealed class AppScreen(val route: String, open val subUrl: String = "") {
 
 @HiltViewModel
 class MainViewModel @Inject constructor(
+    @ApplicationContext private val context: Context,
     private val appStateRepository: AppStateRepository,
     private val recordingDao:RecordingDao,
+    private val scanDao: ScanDao,
+    private val iemDao: IEMDao,
     private val billingRepository: BillingRepositoryInterface
 ) : ViewModel() {
     companion object {
@@ -111,6 +128,7 @@ class MainViewModel @Inject constructor(
         data object OnDeleteLogFileClicked: UiAction()
         data object OnStartRecordingClicked: UiAction()
         data object OnStopRecordingClicked: UiAction()
+        data object OnChooseRecordingDirectoryClicked: UiAction()
         data class OnDeleteRecordingClicked(val filePath: String): UiAction()
         data object OnDeleteAllRecordingsClicked: UiAction()
         data class OnSaveRecordingClicked(val filename: String, val destUri: Uri): UiAction()
@@ -119,6 +137,8 @@ class MainViewModel @Inject constructor(
         data class ShowDialog(val title: String, val msg: String, val positiveButton: String? = null, val negativeButton: String? = null, val action: (() -> Unit)? = null): UiAction()
         data object ShowDonationDialog: UiAction()
         data object OnBuyFullVersionClicked: UiAction()
+        data class ShowRecordingFinishedNotification(val recordingName: String, val sizeInBytes: Long): UiAction()
+        data object ShowRecordingResumedNotification: UiAction()
     }
     private fun sendActionToUi(uiAction: UiAction){ viewModelScope.launch { _uiActions.emit(uiAction) } }
 
@@ -156,8 +176,10 @@ class MainViewModel @Inject constructor(
                     buttonText = "Undo",
                     callback = { snackbarResult ->
                         if (snackbarResult == SnackbarResult.ActionPerformed) {
+                            Log.i(TAG, "deleteRecordingWithUndo: User clicked Undo, restoring recording")
                             insertRecording(recording)
                         } else {
+                            Log.i(TAG, "deleteRecordingWithUndo: Snackbar dismissed, deleting file: ${recording.filePath}")
                             sendActionToUi(UiAction.OnDeleteRecordingClicked(recording.filePath))
                         }
                     }
@@ -207,6 +229,53 @@ class MainViewModel @Inject constructor(
             }
         ))
         Log.d(TAG, "showUsageTimeUsedUpDialog")
+    }
+
+    // Auto-resume recording after USB reconnection
+    fun restartRecordingAfterReconnect() {
+        Log.i(TAG, "restartRecordingAfterReconnect: Attempting to restart recording after USB reconnection")
+
+        // Check if already recording (shouldn't happen, but just in case)
+        if (appStateRepository.recordingRunning.value) {
+            Log.w(TAG, "restartRecordingAfterReconnect: Recording is already running. Ignoring auto-resume request.")
+            return
+        }
+
+        // Check if analyzer is running - recording requires active analyzer
+        if (!appStateRepository.analyzerRunning.value) {
+            Log.i(TAG, "restartRecordingAfterReconnect: Analyzer not running. Starting analyzer first...")
+
+            // Start the analyzer
+            sendActionToUi(UiAction.OnStartClicked)
+
+            // Wait for analyzer to start, then start recording
+            viewModelScope.launch {
+                // Wait for analyzer to be running (with timeout)
+                var waitTime = 0L
+                val maxWaitTime = 10000L // 10 seconds max
+                val checkInterval = 500L // Check every 500ms
+
+                while (!appStateRepository.analyzerRunning.value && waitTime < maxWaitTime) {
+                    kotlinx.coroutines.delay(checkInterval)
+                    waitTime += checkInterval
+                }
+
+                if (appStateRepository.analyzerRunning.value) {
+                    Log.i(TAG, "restartRecordingAfterReconnect: Analyzer started after ${waitTime}ms. Starting recording...")
+                    sendActionToUi(UiAction.OnStartRecordingClicked)
+                    sendActionToUi(UiAction.ShowRecordingResumedNotification)
+                } else {
+                    Log.e(TAG, "restartRecordingAfterReconnect: Analyzer failed to start after ${waitTime}ms. Cannot resume recording.")
+                    showSnackbar(SnackbarEvent("Cannot auto-resume: Analyzer failed to start"))
+                }
+            }
+            return
+        }
+
+        // Analyzer already running, start recording immediately
+        Log.i(TAG, "restartRecordingAfterReconnect: Analyzer already running. Starting recording...")
+        sendActionToUi(UiAction.OnStartRecordingClicked)
+        sendActionToUi(UiAction.ShowRecordingResumedNotification)
     }
 
     // ACTIONS
@@ -345,16 +414,40 @@ class MainViewModel @Inject constructor(
         onAirspyVgaGainChanged = appStateRepository.airspyVgaGain::set,
         onAirspyLnaGainChanged = appStateRepository.airspyLnaGain::set,
         onAirspyMixerGainChanged = appStateRepository.airspyMixerGain::set,
-        onAirspyLinearityGainChanged = appStateRepository.airspyLinearityGain::set,
-        onAirspySensitivityGainChanged = appStateRepository.airspySensitivityGain::set,
+        onAirspyLinearityGainChanged = { newGain ->
+            appStateRepository.airspyLinearityGain.set(newGain)
+            // Linearity and sensitivity gains are mutually exclusive - zero out the other
+            if (newGain > 0) {
+                appStateRepository.airspySensitivityGain.set(0)
+            }
+        },
+        onAirspySensitivityGainChanged = { newGain ->
+            appStateRepository.airspySensitivityGain.set(newGain)
+            // Linearity and sensitivity gains are mutually exclusive - zero out the other
+            if (newGain > 0) {
+                appStateRepository.airspyLinearityGain.set(0)
+            }
+        },
         onAirspyRfBiasEnabledChanged = appStateRepository.airspyRfBiasEnabled::set,
         onAirspyConverterOffsetChanged = appStateRepository.airspyConverterOffset::set,
         onHydraSdrAdvancedGainEnabledChanged = appStateRepository.hydraSdrAdvancedGainEnabled::set,
         onHydraSdrVgaGainChanged = appStateRepository.hydraSdrVgaGain::set,
         onHydraSdrLnaGainChanged = appStateRepository.hydraSdrLnaGain::set,
         onHydraSdrMixerGainChanged = appStateRepository.hydraSdrMixerGain::set,
-        onHydraSdrLinearityGainChanged = appStateRepository.hydraSdrLinearityGain::set,
-        onHydraSdrSensitivityGainChanged = appStateRepository.hydraSdrSensitivityGain::set,
+        onHydraSdrLinearityGainChanged = { newGain ->
+            appStateRepository.hydraSdrLinearityGain.set(newGain)
+            // Linearity and sensitivity gains are mutually exclusive - zero out the other
+            if (newGain > 0) {
+                appStateRepository.hydraSdrSensitivityGain.set(0)
+            }
+        },
+        onHydraSdrSensitivityGainChanged = { newGain ->
+            appStateRepository.hydraSdrSensitivityGain.set(newGain)
+            // Linearity and sensitivity gains are mutually exclusive - zero out the other
+            if (newGain > 0) {
+                appStateRepository.hydraSdrLinearityGain.set(0)
+            }
+        },
         onHydraSdrRfBiasEnabledChanged = appStateRepository.hydraSdrRfBiasEnabled::set,
         onHydraSdrRfPortChanged = appStateRepository.hydraSdrRfPort::set,
         onHydraSdrConverterOffsetChanged = appStateRepository.hydraSdrConverterOffset::set,
@@ -454,8 +547,1064 @@ class MainViewModel @Inject constructor(
                 sendActionToUi(UiAction.OnStartRecordingClicked)
             }
         },
-        onViewRecordingsClicked = { navigate(AppScreen.RecordingScreen) }
+        onViewRecordingsClicked = { navigate(AppScreen.RecordingScreen) },
+        onChooseRecordingDirectoryClicked = { sendActionToUi(UiAction.OnChooseRecordingDirectoryClicked) },
+        onAutoResumeRecordingChanged = appStateRepository.autoResumeRecording::set,
+        onSplitAt4GBChanged = appStateRepository.recordingSplitAt4GB::set
     )
+
+    // Scan Tab
+    private var scanJob: kotlinx.coroutines.Job? = null
+
+    val scanTabActions = ScanTabActions(
+        onStartFrequencyChanged = appStateRepository.scanStartFrequency::set,
+        onEndFrequencyChanged = appStateRepository.scanEndFrequency::set,
+        onThresholdChanged = appStateRepository.scanThreshold::set,
+        onStepSizeChanged = appStateRepository.scanStepSize::set,
+        onDwellTimeChanged = appStateRepository.scanDwellTime::set,
+        onDetectionModeChanged = appStateRepository.scanDetectionMode::set,
+        onNoiseFloorMarginChanged = appStateRepository.scanNoiseFloorMargin::set,
+        onSignalGroupingChanged = appStateRepository.scanEnableSignalGrouping::set,
+        onMinimumGapChanged = appStateRepository.scanMinimumGap::set,
+        onStartScanClicked = { startScanning() },
+        onStopScanClicked = { stopScanning() },
+        onClearResultsClicked = {
+            appStateRepository.discoveredSignals.set(emptyList())
+            appStateRepository.currentScanResultId.set(null)
+            appStateRepository.noiseFloorLevel.set(-999f)
+        },
+        onTuneToSignal = { frequency ->
+            if (!appStateRepository.scanRunning.value) {
+                appStateRepository.sourceFrequency.set(frequency)
+                // Center the channel on the frequency
+                appStateRepository.channelFrequency.set(frequency)
+            }
+        },
+        onRemoveSignal = { signal ->
+            val currentSignals = appStateRepository.discoveredSignals.value
+            appStateRepository.discoveredSignals.set(currentSignals.filter { it.frequency != signal.frequency })
+        }
+    )
+
+    // IEM Presets Tab
+    private var iemScanJob: kotlinx.coroutines.Job? = null
+
+    val iemPresetsTabActions = IEMPresetsTabActions(
+        onPresetSelectionChanged = { presetId, selected ->
+            val currentSelection = appStateRepository.iemSelectedPresetIds.value.toMutableSet()
+            if (selected) {
+                currentSelection.add(presetId)
+            } else {
+                currentSelection.remove(presetId)
+            }
+            appStateRepository.iemSelectedPresetIds.set(currentSelection)
+        },
+        onStartScanClicked = { startIEMScanning() },
+        onStopScanClicked = { stopIEMScanning() },
+        onClearResultsClicked = {
+            appStateRepository.iemDetectedChannels.set(emptyList())
+            appStateRepository.iemCurrentScanResultId.set(null)
+        },
+        onTuneToChannel = { frequency ->
+            if (!appStateRepository.iemScanRunning.value) {
+                appStateRepository.sourceFrequency.set(frequency)
+                appStateRepository.channelFrequency.set(frequency)
+            }
+        },
+        onRecordChannel = { frequency ->
+            if (!appStateRepository.iemScanRunning.value && !appStateRepository.recordingRunning.value) {
+                // Tune to the frequency first
+                appStateRepository.sourceFrequency.set(frequency)
+                appStateRepository.channelFrequency.set(frequency)
+                // Start recording
+                sendActionToUi(UiAction.OnStartRecordingClicked)
+            }
+        },
+        onRemoveDetection = { detection ->
+            val currentDetections = appStateRepository.iemDetectedChannels.value
+            appStateRepository.iemDetectedChannels.set(currentDetections.filter {
+                it.detectedChannel.id != detection.detectedChannel.id
+            })
+        },
+        onDetectionThresholdChanged = appStateRepository.iemDetectionThreshold::set,
+        onNoiseFloorMarginChanged = appStateRepository.iemNoiseFloorMargin::set,
+        onUseNoiseFloorChanged = appStateRepository.iemUseNoiseFloor::set
+    )
+
+    // Air Communication Scanner Tab
+    private var airCommScanJob: kotlinx.coroutines.Job? = null
+
+    val airCommTabActions = AirCommTabActions(
+        onStartFrequencyChanged = appStateRepository.airCommStartFrequency::set,
+        onEndFrequencyChanged = appStateRepository.airCommEndFrequency::set,
+        onStepSizeChanged = appStateRepository.airCommStepSize::set,
+        onDwellTimeChanged = appStateRepository.airCommDwellTime::set,
+        onHangTimeChanged = appStateRepository.airCommHangTime::set,
+        onDetectionThresholdChanged = appStateRepository.airCommDetectionThreshold::set,
+        onNoiseFloorMarginChanged = appStateRepository.airCommNoiseFloorMargin::set,
+        onUseNoiseFloorChanged = appStateRepository.airCommUseNoiseFloor::set,
+        onStartScanClicked = { startAirCommScanning() },
+        onStopScanClicked = { stopAirCommScanning() },
+        onAddToExceptionList = { frequency ->
+            val current = appStateRepository.airCommExceptionList.value.toMutableSet()
+            current.add(frequency)
+            appStateRepository.airCommExceptionList.set(current)
+            Log.d(TAG, "Air Comm: Added ${frequency.asStringWithUnit("Hz")} to exception list")
+        },
+        onRemoveFromExceptionList = { frequency ->
+            val current = appStateRepository.airCommExceptionList.value.toMutableSet()
+            current.remove(frequency)
+            appStateRepository.airCommExceptionList.set(current)
+            Log.d(TAG, "Air Comm: Removed ${frequency.asStringWithUnit("Hz")} from exception list")
+        },
+        onClearExceptionList = {
+            appStateRepository.airCommExceptionList.set(emptySet())
+            Log.d(TAG, "Air Comm: Cleared exception list")
+        },
+        onResetToDefaults = {
+            // Reset all Air Comm settings to default values
+            appStateRepository.airCommStartFrequency.set(118000000L) // 118 MHz
+            appStateRepository.airCommEndFrequency.set(137000000L)   // 137 MHz
+            appStateRepository.airCommStepSize.set(25000L)           // 25 kHz
+            appStateRepository.airCommDwellTime.set(100L)            // 100ms
+            appStateRepository.airCommHangTime.set(3000L)            // 3 seconds
+            appStateRepository.airCommDetectionThreshold.set(-40f)   // -40 dB
+            appStateRepository.airCommNoiseFloorMargin.set(15f)      // 15 dB
+            appStateRepository.airCommUseNoiseFloor.set(true)        // Use adaptive detection
+            appStateRepository.airCommExceptionList.set(emptySet())  // Clear exception list
+            Log.d(TAG, "Air Comm: Reset all settings to defaults")
+            showSnackbar(SnackbarEvent("Air Comm settings reset to defaults"))
+        }
+    )
+
+    private fun startIEMScanning() {
+        // Validate preconditions
+        if (!appStateRepository.analyzerRunning.value) {
+            showSnackbar(SnackbarEvent("Analyzer must be running to scan IEM presets"))
+            return
+        }
+        if (appStateRepository.recordingRunning.value) {
+            showSnackbar(SnackbarEvent("Cannot scan while recording is active"))
+            return
+        }
+        if (appStateRepository.iemSelectedPresetIds.value.isEmpty()) {
+            showSnackbar(SnackbarEvent("Please select at least one IEM preset to scan"))
+            return
+        }
+
+        // Start IEM scanning
+        appStateRepository.iemScanRunning.set(true)
+        appStateRepository.iemScanProgress.set(0f)
+        appStateRepository.iemDetectedChannels.set(emptyList())
+
+        val selectedPresetIds = appStateRepository.iemSelectedPresetIds.value.toList()
+        val dwellTime = 300L // Fixed 300ms dwell time for IEM scanning (IEM signals are continuous)
+        val useNoiseFloor = appStateRepository.iemUseNoiseFloor.value
+        val fixedThreshold = appStateRepository.iemDetectionThreshold.value
+        val noiseFloorMargin = appStateRepository.iemNoiseFloorMargin.value
+
+        iemScanJob = viewModelScope.launch {
+            val scanStartTime = System.currentTimeMillis()
+            val detectedChannels = mutableListOf<IEMDetectedChannel>()
+
+            try {
+                // Step 1: Query database for all channels in selected presets
+                val channels = withContext(Dispatchers.IO) {
+                    iemDao.getChannelsForPresets(selectedPresetIds)
+                }
+
+                if (channels.isEmpty()) {
+                    showSnackbar(SnackbarEvent("No channels found in selected presets"))
+                    return@launch
+                }
+
+                Log.d(TAG, "IEM Scan: Found ${channels.size} channels to scan")
+
+                // Step 2: Get current sample rate and calculate usable bandwidth
+                val sampleRate = appStateRepository.sourceSampleRate.value
+                val usableBandwidth = (sampleRate * 0.8).toLong()
+
+                Log.d(TAG, "IEM Scan: sampleRate=$sampleRate, usableBandwidth=$usableBandwidth")
+
+                // Step 2.5: Estimate noise floor if enabled
+                var noiseFloor = -80f // Default fallback
+                if (useNoiseFloor) {
+                    val noiseFloorSamples = mutableListOf<Float>()
+                    // Sample 3 random frequencies from the channels list
+                    val sampleIndices = if (channels.size <= 3) {
+                        channels.indices.toList()
+                    } else {
+                        listOf(0, channels.size / 2, channels.size - 1)
+                    }
+
+                    for (i in sampleIndices) {
+                        appStateRepository.sourceFrequency.set(channels[i].frequency)
+                        delay(dwellTime)
+                        val avgLevel = getAverageSignalLevel()
+                        if (avgLevel != null) noiseFloorSamples.add(avgLevel)
+                    }
+
+                    noiseFloor = if (noiseFloorSamples.isNotEmpty()) {
+                        noiseFloorSamples.average().toFloat()
+                    } else {
+                        -80f
+                    }
+                    appStateRepository.noiseFloorLevel.set(noiseFloor)
+                    Log.d(TAG, "IEM Scan: Estimated noise floor: $noiseFloor dB, margin: $noiseFloorMargin dB")
+                }
+
+                // Step 3: Group channels by frequency proximity (batch channels within same FFT window)
+                val sortedChannels = channels.sortedBy { it.frequency }
+                val channelBatches = mutableListOf<List<com.mantz_it.rfanalyzer.database.IEMChannel>>()
+                var currentBatch = mutableListOf<com.mantz_it.rfanalyzer.database.IEMChannel>()
+
+                for (channel in sortedChannels) {
+                    if (currentBatch.isEmpty()) {
+                        currentBatch.add(channel)
+                    } else {
+                        val batchCenterFreq = (currentBatch.first().frequency + currentBatch.last().frequency) / 2
+                        val freqDiff = kotlin.math.abs(channel.frequency - batchCenterFreq)
+
+                        // Can we fit this channel in current batch's FFT window?
+                        if (freqDiff < usableBandwidth / 2) {
+                            currentBatch.add(channel)
+                        } else {
+                            // Start new batch
+                            channelBatches.add(currentBatch)
+                            currentBatch = mutableListOf(channel)
+                        }
+                    }
+                }
+                if (currentBatch.isNotEmpty()) {
+                    channelBatches.add(currentBatch)
+                }
+
+                Log.d(TAG, "IEM Scan: Grouped ${channels.size} channels into ${channelBatches.size} batches")
+
+                // Step 4: Scan each batch
+                var scannedChannels = 0
+                for ((batchIndex, batch) in channelBatches.withIndex()) {
+                    if (!appStateRepository.iemScanRunning.value) break
+
+                    // Calculate center frequency for this batch
+                    val batchCenterFreq = (batch.first().frequency + batch.last().frequency) / 2
+
+                    // Tune to batch center frequency
+                    appStateRepository.sourceFrequency.set(batchCenterFreq)
+                    appStateRepository.iemCurrentScanFrequency.set(batchCenterFreq)
+
+                    // Wait for FFT to settle
+                    delay(dwellTime)
+
+                    // Step 5: Analyze each channel in this batch
+                    val effectiveThreshold = if (useNoiseFloor) {
+                        noiseFloor + noiseFloorMargin
+                    } else {
+                        fixedThreshold
+                    }
+                    val batchDetections = detectIEMChannelsInFFT(batch, batchCenterFreq, sampleRate, effectiveThreshold)
+                    detectedChannels.addAll(batchDetections)
+
+                    // Update progress
+                    scannedChannels += batch.size
+                    val progress = scannedChannels.toFloat() / channels.size
+                    appStateRepository.iemScanProgress.set(progress)
+
+                    Log.d(TAG, "IEM Scan: Batch ${batchIndex + 1}/${channelBatches.size} - Found ${batchDetections.size} active channels")
+                }
+
+                // Step 6: Save results to database and update UI
+                if (detectedChannels.isNotEmpty()) {
+                    val scanDuration = System.currentTimeMillis() - scanStartTime
+                    val avgStrength = detectedChannels.map { it.averageStrength }.average().toFloat()
+
+                    withContext(Dispatchers.IO) {
+                        val scanResult = IEMScanResult(
+                            timestamp = scanStartTime,
+                            scanDuration = scanDuration,
+                            scannedPresetIds = selectedPresetIds.joinToString(","),
+                            detectedCount = detectedChannels.size,
+                            averageSignalStrength = avgStrength
+                        )
+                        val scanResultId = iemDao.saveScanWithDetections(scanResult, detectedChannels)
+                        appStateRepository.iemCurrentScanResultId.set(scanResultId)
+
+                        // Load full channel info for UI
+                        val channelInfo = iemDao.getDetectedChannelInfoForScan(scanResultId)
+                        appStateRepository.iemDetectedChannels.set(channelInfo)
+                    }
+
+                    showSnackbar(SnackbarEvent("IEM scan complete. Found ${detectedChannels.size} active channels."))
+                } else {
+                    showSnackbar(SnackbarEvent("IEM scan complete. No active channels detected."))
+                }
+
+            } catch (e: Exception) {
+                Log.e(TAG, "Error during IEM scanning", e)
+                showSnackbar(SnackbarEvent("IEM scan failed: ${e.message}"))
+            } finally {
+                appStateRepository.iemScanRunning.set(false)
+            }
+        }
+    }
+
+    private fun stopIEMScanning() {
+        iemScanJob?.cancel()
+        appStateRepository.iemScanRunning.set(false)
+        showSnackbar(SnackbarEvent("IEM scan stopped"))
+    }
+
+    /**
+     * Analyzes FFT data for specific IEM channel frequencies
+     * Uses configurable threshold (fixed or noise floor + margin)
+     */
+    private fun detectIEMChannelsInFFT(
+        channels: List<com.mantz_it.rfanalyzer.database.IEMChannel>,
+        centerFrequency: Long,
+        sampleRate: Long,
+        threshold: Float
+    ): List<IEMDetectedChannel> {
+        val fftProcessorData = appStateRepository.fftProcessorData
+        val detectedChannels = mutableListOf<IEMDetectedChannel>()
+
+        try {
+            fftProcessorData.lock.readLock().lock()
+            try {
+                val waterfallBuffer = fftProcessorData.waterfallBuffer ?: return emptyList()
+                if (waterfallBuffer.isEmpty()) return emptyList()
+
+                val readIndex = fftProcessorData.readIndex
+                if (readIndex < 0 || readIndex >= waterfallBuffer.size) return emptyList()
+
+                val currentFFT = waterfallBuffer[readIndex]
+                if (currentFFT.isEmpty()) return emptyList()
+
+                // Calculate FFT parameters
+                val fftSize = currentFFT.size
+                val frequencyResolution = sampleRate.toFloat() / fftSize
+                val startFrequency = centerFrequency - sampleRate / 2
+
+                // Check each channel frequency
+                for (channel in channels) {
+                    // Calculate FFT bin index for this channel frequency
+                    val binIndex = ((channel.frequency - startFrequency) / frequencyResolution).toInt()
+
+                    if (binIndex in currentFFT.indices) {
+                        // Analyze window around the channel (±100 kHz for 200 kHz IEM bandwidth)
+                        // With typical 2.5 MHz sample rate, this is about ±40 bins
+                        val windowHalfSize = (100000 / frequencyResolution).toInt().coerceAtLeast(5)
+                        val windowStart = (binIndex - windowHalfSize).coerceAtLeast(0)
+                        val windowEnd = (binIndex + windowHalfSize).coerceAtMost(currentFFT.size - 1)
+
+                        val windowData = currentFFT.sliceArray(windowStart..windowEnd)
+                        val peakSignal = windowData.maxOrNull() ?: continue
+                        val avgSignal = windowData.average().toFloat()
+
+                        // Detect if signal is above threshold
+                        // Use peak detection since IEM signals have strong carriers
+                        if (peakSignal > threshold) {
+                            detectedChannels.add(
+                                IEMDetectedChannel(
+                                    id = 0,
+                                    scanResultId = 0, // Will be set when saving to DB
+                                    channelId = channel.id,
+                                    peakStrength = peakSignal,
+                                    averageStrength = avgSignal,
+                                    detectionConfidence = 1.0f
+                                )
+                            )
+
+                            Log.d(TAG, "IEM detected: ${channel.frequency.asStringWithUnit("Hz")} - " +
+                                    "peak=${peakSignal.toInt()}dB, avg=${avgSignal.toInt()}dB")
+                        }
+                    }
+                }
+
+            } finally {
+                fftProcessorData.lock.readLock().unlock()
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error detecting IEM channels in FFT", e)
+        }
+
+        return detectedChannels
+    }
+
+    // ===== Air Communication Scanner Functions =====
+
+    private fun startAirCommScanning() {
+        // Validate preconditions
+        if (!appStateRepository.analyzerRunning.value) {
+            showSnackbar(SnackbarEvent("Analyzer must be running to scan air communications"))
+            return
+        }
+        if (appStateRepository.recordingRunning.value) {
+            showSnackbar(SnackbarEvent("Cannot scan while recording is active"))
+            return
+        }
+
+        val startFreq = appStateRepository.airCommStartFrequency.value
+        val endFreq = appStateRepository.airCommEndFrequency.value
+
+        if (startFreq >= endFreq) {
+            showSnackbar(SnackbarEvent("Start frequency must be less than end frequency"))
+            return
+        }
+
+        // Start Air Comm scanning
+        appStateRepository.airCommScanRunning.set(true)
+        appStateRepository.airCommSignalDetected.set(false)
+        appStateRepository.airCommCurrentFrequency.set(startFreq)
+
+        val stepSize = appStateRepository.airCommStepSize.value
+        val dwellTime = appStateRepository.airCommDwellTime.value
+        val hangTime = appStateRepository.airCommHangTime.value
+        val useNoiseFloor = appStateRepository.airCommUseNoiseFloor.value
+        val fixedThreshold = appStateRepository.airCommDetectionThreshold.value
+        val noiseFloorMargin = appStateRepository.airCommNoiseFloorMargin.value
+
+        // Auto-enable AM demodulation for air communications
+        if (appStateRepository.demodulationMode.value != DemodulationMode.AM) {
+            appStateRepository.demodulationMode.set(DemodulationMode.AM)
+            Log.d(TAG, "Air Comm Scan: Auto-enabled AM demodulation")
+        }
+
+        airCommScanJob = viewModelScope.launch {
+            try {
+                // Estimate noise floor if enabled
+                var noiseFloor = -80f
+                if (useNoiseFloor) {
+                    val noiseFloorSamples = mutableListOf<Float>()
+                    // Sample 3 frequencies across the range
+                    for (i in 0 until 3) {
+                        val sampleFreq = startFreq + (i * (endFreq - startFreq) / 3)
+                        appStateRepository.sourceFrequency.set(sampleFreq)
+                        delay(dwellTime)
+                        val avgLevel = getAverageSignalLevel()
+                        if (avgLevel != null) noiseFloorSamples.add(avgLevel)
+                    }
+
+                    noiseFloor = if (noiseFloorSamples.isNotEmpty()) {
+                        noiseFloorSamples.average().toFloat()
+                    } else {
+                        -80f
+                    }
+                    appStateRepository.noiseFloorLevel.set(noiseFloor)
+                    Log.d(TAG, "Air Comm Scan: Estimated noise floor: $noiseFloor dB, margin: $noiseFloorMargin dB")
+                }
+
+                // Calculate effective threshold
+                val effectiveThreshold = if (useNoiseFloor) {
+                    noiseFloor + noiseFloorMargin
+                } else {
+                    fixedThreshold
+                }
+
+                // Get sample rate and calculate FFT batching
+                val sampleRate = appStateRepository.sourceSampleRate.value
+                val usableBandwidth = (sampleRate * 0.8).toLong()
+
+                // Build list of target frequencies to scan
+                val targetFrequencies = mutableListOf<Long>()
+                var freq = startFreq
+                while (freq <= endFreq) {
+                    targetFrequencies.add(freq)
+                    freq += stepSize
+                }
+
+                // Group frequencies into batches based on FFT coverage
+                val frequencyBatches = mutableListOf<List<Long>>()
+                var currentBatch = mutableListOf<Long>()
+                var batchCenterFreq = 0L
+
+                for (targetFreq in targetFrequencies) {
+                    if (currentBatch.isEmpty()) {
+                        currentBatch.add(targetFreq)
+                        batchCenterFreq = targetFreq
+                    } else {
+                        val freqDiff = kotlin.math.abs(targetFreq - batchCenterFreq)
+                        // Can we fit this frequency in current batch's FFT window?
+                        if (freqDiff < usableBandwidth / 2) {
+                            currentBatch.add(targetFreq)
+                        } else {
+                            // Start new batch
+                            frequencyBatches.add(currentBatch)
+                            currentBatch = mutableListOf(targetFreq)
+                            batchCenterFreq = targetFreq
+                        }
+                    }
+                }
+                if (currentBatch.isNotEmpty()) {
+                    frequencyBatches.add(currentBatch)
+                }
+
+                Log.d(TAG, "Air Comm Scan: Starting continuous scan from ${startFreq.asStringWithUnit("Hz")} to ${endFreq.asStringWithUnit("Hz")}")
+                Log.d(TAG, "Air Comm Scan: Grouped ${targetFrequencies.size} frequencies into ${frequencyBatches.size} FFT batches (sample rate=${sampleRate.asStringWithUnit("Hz")}, usable=${usableBandwidth.asStringWithUnit("Hz")})")
+                Log.d(TAG, "Air Comm Scan: Effective threshold=$effectiveThreshold dB")
+
+                // Continuous scan loop
+                while (appStateRepository.airCommScanRunning.value) {
+                    // Scan through frequency batches
+                    for (batch in frequencyBatches) {
+                        if (!appStateRepository.airCommScanRunning.value) break
+
+                        // Calculate center frequency for this batch
+                        val batchCenter = (batch.first() + batch.last()) / 2
+
+                        // Tune to batch center frequency ONCE
+                        appStateRepository.sourceFrequency.set(batchCenter)
+
+                        // Wait for FFT to settle
+                        delay(dwellTime)
+
+                        // Check each frequency in this batch
+                        val exceptionList = appStateRepository.airCommExceptionList.value
+
+                        for (targetFreq in batch) {
+                            if (!appStateRepository.airCommScanRunning.value) break
+
+                            appStateRepository.airCommCurrentFrequency.set(targetFreq)
+
+                            // Skip if in exception list
+                            if (exceptionList.contains(targetFreq)) {
+                                continue
+                            }
+
+                            // Detect signal at this specific frequency within the FFT
+                            val signalStrength = detectAirCommSignalAtFrequency(targetFreq, batchCenter, sampleRate)
+                            appStateRepository.airCommSignalStrength.set(signalStrength ?: -999f)
+
+                            if (signalStrength != null && signalStrength > effectiveThreshold) {
+                                // SIGNAL DETECTED - PAUSE SCANNING
+                                appStateRepository.airCommSignalDetected.set(true)
+                                Log.d(TAG, "Air Comm Scan: Signal detected at ${targetFreq.asStringWithUnit("Hz")}, strength=$signalStrength dB - PAUSED")
+
+                                // Tune to the detected frequency for better reception
+                                appStateRepository.sourceFrequency.set(targetFreq)
+                                appStateRepository.channelFrequency.set(targetFreq)
+                                delay(dwellTime)
+
+                                // Monitor signal while active
+                                var addedToExceptionList = false
+                                while (appStateRepository.airCommScanRunning.value) {
+                                    delay(100) // Check signal every 100ms
+
+                                    // Check if this frequency was added to exception list
+                                    val currentExceptionList = appStateRepository.airCommExceptionList.value
+                                    if (currentExceptionList.contains(targetFreq)) {
+                                        Log.d(TAG, "Air Comm Scan: Frequency ${targetFreq.asStringWithUnit("Hz")} added to exception list, resuming scan")
+                                        addedToExceptionList = true
+                                        break
+                                    }
+
+                                    val currentSignal = detectAirCommSignal()
+                                    appStateRepository.airCommSignalStrength.set(currentSignal ?: -999f)
+
+                                    // Signal dropped below threshold
+                                    if (currentSignal == null || currentSignal <= effectiveThreshold) {
+                                        Log.d(TAG, "Air Comm Scan: Signal dropped, entering hang time (${hangTime}ms)")
+                                        break
+                                    }
+                                }
+
+                                // HANG TIME - Wait before resuming scan (skip if added to exception list)
+                                appStateRepository.airCommSignalDetected.set(false)
+                                if (!addedToExceptionList && hangTime > 0 && appStateRepository.airCommScanRunning.value) {
+                                    delay(hangTime)
+                                }
+
+                                // Break out of frequency loop to restart batch scanning
+                                break
+                            }
+                        }
+                    }
+
+                    // Loop completed, restart from beginning
+                    Log.d(TAG, "Air Comm Scan: Scan loop completed, restarting...")
+                }
+
+            } catch (e: CancellationException) {
+                // Normal cancellation - don't show error
+                throw e
+            } catch (e: Exception) {
+                Log.e(TAG, "Error during air comm scanning", e)
+                showSnackbar(SnackbarEvent("Air comm scan failed: ${e.message}"))
+            } finally {
+                appStateRepository.airCommScanRunning.set(false)
+                appStateRepository.airCommSignalDetected.set(false)
+                appStateRepository.airCommSignalStrength.set(-999f)
+            }
+        }
+    }
+
+    private fun stopAirCommScanning() {
+        airCommScanJob?.cancel()
+        appStateRepository.airCommScanRunning.set(false)
+        appStateRepository.airCommSignalDetected.set(false)
+        showSnackbar(SnackbarEvent("Air comm scan stopped"))
+    }
+
+    /**
+     * Detects air communication signals at current frequency
+     * Returns signal strength in dB or null if no signal detected
+     */
+    private fun detectAirCommSignal(): Float? {
+        val fftProcessorData = appStateRepository.fftProcessorData
+
+        return try {
+            fftProcessorData.lock.readLock().lock()
+            try {
+                val waterfallBuffer = fftProcessorData.waterfallBuffer ?: return null
+                if (waterfallBuffer.isEmpty()) return null
+
+                val readIndex = fftProcessorData.readIndex
+                if (readIndex < 0 || readIndex >= waterfallBuffer.size) return null
+
+                val currentFFT = waterfallBuffer[readIndex]
+                if (currentFFT.isEmpty()) return null
+
+                // For AM aviation signals, analyze center ±12.5 kHz window
+                // (25 kHz channel spacing, so ±12.5 kHz covers the signal)
+                val fftSize = currentFFT.size
+                val centerBin = fftSize / 2
+
+                // Calculate window size (±12.5 kHz)
+                val sampleRate = appStateRepository.sourceSampleRate.value
+                val frequencyResolution = sampleRate.toFloat() / fftSize
+                val windowHalfSize = (12500 / frequencyResolution).toInt().coerceAtLeast(3)
+
+                val windowStart = (centerBin - windowHalfSize).coerceAtLeast(0)
+                val windowEnd = (centerBin + windowHalfSize).coerceAtMost(currentFFT.size - 1)
+
+                val windowData = currentFFT.sliceArray(windowStart..windowEnd)
+                val peakSignal = windowData.maxOrNull() ?: return null
+
+                peakSignal
+
+            } finally {
+                fftProcessorData.lock.readLock().unlock()
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error detecting air comm signal", e)
+            null
+        }
+    }
+
+    /**
+     * Detects air communication signal at a specific frequency within the current FFT
+     * Used for FFT batching optimization - analyzes targetFreq when tuned to batchCenter
+     *
+     * @param targetFreq The actual frequency to check for signal
+     * @param batchCenter The frequency we're currently tuned to
+     * @param sampleRate Current sample rate (determines FFT coverage)
+     * @return Signal strength in dB or null if no signal detected
+     */
+    private fun detectAirCommSignalAtFrequency(
+        targetFreq: Long,
+        batchCenter: Long,
+        sampleRate: Long
+    ): Float? {
+        val fftProcessorData = appStateRepository.fftProcessorData
+
+        return try {
+            fftProcessorData.lock.readLock().lock()
+            try {
+                val waterfallBuffer = fftProcessorData.waterfallBuffer ?: return null
+                if (waterfallBuffer.isEmpty()) return null
+
+                val readIndex = fftProcessorData.readIndex
+                if (readIndex < 0 || readIndex >= waterfallBuffer.size) return null
+
+                val currentFFT = waterfallBuffer[readIndex]
+                if (currentFFT.isEmpty()) return null
+
+                // Calculate FFT parameters
+                val fftSize = currentFFT.size
+                val frequencyResolution = sampleRate.toFloat() / fftSize
+                val startFrequency = batchCenter - sampleRate / 2
+
+                // Calculate bin index for target frequency
+                val frequencyOffset = targetFreq - startFrequency
+                val binIndex = (frequencyOffset / frequencyResolution).toInt()
+
+                // Check if target frequency is within FFT range
+                if (binIndex !in currentFFT.indices) return null
+
+                // Analyze ±12.5 kHz window (25 kHz channel spacing)
+                val windowHalfSize = (12500 / frequencyResolution).toInt().coerceAtLeast(3)
+                val windowStart = (binIndex - windowHalfSize).coerceAtLeast(0)
+                val windowEnd = (binIndex + windowHalfSize).coerceAtMost(currentFFT.size - 1)
+
+                val windowData = currentFFT.sliceArray(windowStart..windowEnd)
+                val peakSignal = windowData.maxOrNull() ?: return null
+
+                peakSignal
+
+            } finally {
+                fftProcessorData.lock.readLock().unlock()
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error detecting air comm signal at frequency $targetFreq", e)
+            null
+        }
+    }
+
+    private fun startScanning() {
+        // Validate preconditions
+        if (!appStateRepository.analyzerRunning.value) {
+            showSnackbar(SnackbarEvent("Analyzer must be running to scan"))
+            return
+        }
+        if (appStateRepository.recordingRunning.value) {
+            showSnackbar(SnackbarEvent("Cannot scan while recording is active"))
+            return
+        }
+        if (appStateRepository.scanStartFrequency.value >= appStateRepository.scanEndFrequency.value) {
+            showSnackbar(SnackbarEvent("Start frequency must be less than end frequency"))
+            return
+        }
+
+        // Start scanning
+        appStateRepository.scanRunning.set(true)
+        appStateRepository.scanProgress.set(0f)
+        appStateRepository.discoveredSignals.set(emptyList())
+
+        val startFreq = appStateRepository.scanStartFrequency.value
+        val endFreq = appStateRepository.scanEndFrequency.value
+        val stepSize = appStateRepository.scanStepSize.value
+        val dwellTime = appStateRepository.scanDwellTime.value
+        val threshold = appStateRepository.scanThreshold.value
+        val detectionMode = appStateRepository.scanDetectionMode.value
+        val noiseFloorMargin = appStateRepository.scanNoiseFloorMargin.value
+        val enableGrouping = appStateRepository.scanEnableSignalGrouping.value
+        val minimumGap = appStateRepository.scanMinimumGap.value
+
+        scanJob = viewModelScope.launch {
+            val rawDetectionsList = mutableListOf<DiscoveredSignal>()
+
+            try {
+                // Get current sample rate (FFT bandwidth)
+                val sampleRate = appStateRepository.sourceSampleRate.value
+
+                // Use middle 80% of FFT bandwidth to avoid edge effects
+                val usableBandwidth = (sampleRate * 0.8).toLong()
+
+                Log.d(TAG, "Scanning with FFT bandwidth optimization: sampleRate=$sampleRate, usableBandwidth=$usableBandwidth")
+
+                // Step 1: Estimate noise floor (sample 5 positions across the range)
+                val noiseFloorSamples = mutableListOf<Float>()
+                for (i in 0 until 5) {
+                    val sampleFreq = startFreq + (i * (endFreq - startFreq) / 5)
+                    appStateRepository.sourceFrequency.set(sampleFreq)
+                    delay(dwellTime)
+                    val avgLevel = getAverageSignalLevel()
+                    if (avgLevel != null) noiseFloorSamples.add(avgLevel)
+                }
+                val noiseFloor = if (noiseFloorSamples.isNotEmpty()) {
+                    noiseFloorSamples.average().toFloat()
+                } else {
+                    -80f // Default if estimation fails
+                }
+                appStateRepository.noiseFloorLevel.set(noiseFloor)
+                Log.d(TAG, "Estimated noise floor: $noiseFloor dB, margin: $noiseFloorMargin dB")
+
+                // Step 2: Scan using FFT bandwidth (much more efficient!)
+                // Instead of tuning to each frequency, we tune once and analyze the entire FFT
+                var tuneFrequency = startFreq
+                val totalRange = endFreq - startFreq
+                var scannedRange = 0L
+
+                while (tuneFrequency <= endFreq && appStateRepository.scanRunning.value) {
+                    // Tune to this position
+                    appStateRepository.sourceFrequency.set(tuneFrequency)
+                    appStateRepository.currentScanFrequency.set(tuneFrequency)
+
+                    // Wait for FFT to settle
+                    delay(dwellTime)
+
+                    // Analyze all frequencies in the usable FFT bandwidth
+                    val detectedSignals = detectSignalsInFFT(
+                        tuneFrequency,
+                        sampleRate,
+                        usableBandwidth,
+                        stepSize,
+                        threshold,
+                        detectionMode,
+                        noiseFloor,
+                        noiseFloorMargin,
+                        startFreq,
+                        endFreq
+                    )
+
+                    rawDetectionsList.addAll(detectedSignals)
+
+                    // Update progress
+                    scannedRange = minOf(tuneFrequency - startFreq + usableBandwidth, totalRange)
+                    val progress = scannedRange.toFloat() / totalRange
+                    appStateRepository.scanProgress.set(progress)
+
+                    // Move to next FFT window (with small overlap to avoid missing signals)
+                    tuneFrequency += (usableBandwidth * 0.9).toLong()
+                }
+
+                // Step 3: Group signals if enabled
+                val finalSignalsList = if (enableGrouping && rawDetectionsList.isNotEmpty()) {
+                    groupSignals(rawDetectionsList, stepSize, minimumGap)
+                } else {
+                    rawDetectionsList
+                }
+
+                // Update UI with final results
+                appStateRepository.discoveredSignals.set(finalSignalsList)
+
+                // Save scan results to database
+                if (finalSignalsList.isNotEmpty()) {
+                    withContext(Dispatchers.IO) {
+                        val scanResult = ScanResult(
+                            timestamp = System.currentTimeMillis(),
+                            startFrequency = startFreq,
+                            endFrequency = endFreq,
+                            threshold = threshold,
+                            stepSize = stepSize,
+                            dwellTime = dwellTime
+                        )
+                        val scanResultId = scanDao.saveScanWithSignals(scanResult, finalSignalsList)
+                        appStateRepository.currentScanResultId.set(scanResultId)
+                    }
+                }
+
+                showSnackbar(SnackbarEvent("Scan complete. Found ${finalSignalsList.size} signals (${rawDetectionsList.size} raw detections)."))
+            } catch (e: Exception) {
+                Log.e(TAG, "Error during scanning", e)
+                showSnackbar(SnackbarEvent("Scan failed: ${e.message}"))
+            } finally {
+                appStateRepository.scanRunning.set(false)
+            }
+        }
+    }
+
+    private fun stopScanning() {
+        scanJob?.cancel()
+        appStateRepository.scanRunning.set(false)
+        showSnackbar(SnackbarEvent("Scan stopped"))
+    }
+
+    private fun getAverageSignalLevel(): Float? {
+        val fftProcessorData = appStateRepository.fftProcessorData
+        return try {
+            fftProcessorData.lock.readLock().lock()
+            try {
+                val waterfallBuffer = fftProcessorData.waterfallBuffer
+                if (waterfallBuffer == null || waterfallBuffer.isEmpty()) return null
+
+                val readIndex = fftProcessorData.readIndex
+                if (readIndex < 0 || readIndex >= waterfallBuffer.size) return null
+
+                val currentFFT = waterfallBuffer[readIndex]
+                if (currentFFT.isEmpty()) return null
+
+                currentFFT.average().toFloat()
+            } finally {
+                fftProcessorData.lock.readLock().unlock()
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error getting average signal level", e)
+            null
+        }
+    }
+
+    private fun detectSignal(threshold: Float, mode: ScanDetectionMode, noiseFloor: Float, noiseFloorMargin: Float): Pair<Float, Float>? {
+        val fftProcessorData = appStateRepository.fftProcessorData
+
+        return try {
+            fftProcessorData.lock.readLock().lock()
+            try {
+                val waterfallBuffer = fftProcessorData.waterfallBuffer
+                if (waterfallBuffer == null || waterfallBuffer.isEmpty()) return null
+
+                val readIndex = fftProcessorData.readIndex
+                if (readIndex < 0 || readIndex >= waterfallBuffer.size) return null
+
+                val currentFFT = waterfallBuffer[readIndex]
+                if (currentFFT.isEmpty()) return null
+
+                // Calculate peak and average signal strength
+                val peakSignal = currentFFT.maxOrNull() ?: return null
+                val avgSignal = currentFFT.average().toFloat()
+
+                // Use noise floor + margin as effective threshold
+                val effectiveThreshold = maxOf(threshold, noiseFloor + noiseFloorMargin)
+
+                // Apply detection mode
+                val detected = when (mode) {
+                    ScanDetectionMode.PEAK_ONLY -> peakSignal > effectiveThreshold
+                    ScanDetectionMode.AVERAGE_ONLY -> avgSignal > effectiveThreshold
+                    ScanDetectionMode.PEAK_OR_AVERAGE -> peakSignal > effectiveThreshold || avgSignal > effectiveThreshold
+                }
+
+                if (detected) {
+                    Pair(peakSignal, avgSignal)
+                } else {
+                    null
+                }
+            } finally {
+                fftProcessorData.lock.readLock().unlock()
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error detecting signal", e)
+            null
+        }
+    }
+
+    /**
+     * Analyzes all frequencies in the current FFT and returns detected signals
+     * This is much more efficient than tuning to each individual frequency
+     */
+    private fun detectSignalsInFFT(
+        centerFrequency: Long,
+        sampleRate: Long,
+        usableBandwidth: Long,
+        stepSize: Long,
+        threshold: Float,
+        mode: ScanDetectionMode,
+        noiseFloor: Float,
+        noiseFloorMargin: Float,
+        scanStartFreq: Long,
+        scanEndFreq: Long
+    ): List<DiscoveredSignal> {
+        val fftProcessorData = appStateRepository.fftProcessorData
+        val detectedSignals = mutableListOf<DiscoveredSignal>()
+
+        try {
+            fftProcessorData.lock.readLock().lock()
+            try {
+                val waterfallBuffer = fftProcessorData.waterfallBuffer ?: return emptyList()
+                if (waterfallBuffer.isEmpty()) return emptyList()
+
+                val readIndex = fftProcessorData.readIndex
+                if (readIndex < 0 || readIndex >= waterfallBuffer.size) return emptyList()
+
+                val currentFFT = waterfallBuffer[readIndex]
+                if (currentFFT.isEmpty()) return emptyList()
+
+                // Calculate FFT parameters
+                val fftSize = currentFFT.size
+                val frequencyResolution = sampleRate.toFloat() / fftSize
+                val startFrequency = centerFrequency - sampleRate / 2
+                val usableStartOffset = ((sampleRate - usableBandwidth) / 2).toLong()
+                val usableEndOffset = usableStartOffset + usableBandwidth
+
+                // Use noise floor + margin as effective threshold
+                val effectiveThreshold = maxOf(threshold, noiseFloor + noiseFloorMargin)
+
+                // Scan through the FFT at stepSize intervals
+                var currentFreq = maxOf(scanStartFreq, startFrequency + usableStartOffset)
+                val endFreq = minOf(scanEndFreq, startFrequency + usableEndOffset)
+
+                while (currentFreq <= endFreq) {
+                    // Calculate FFT bin index for this frequency
+                    val binIndex = ((currentFreq - startFrequency) / frequencyResolution).toInt()
+
+                    if (binIndex in currentFFT.indices) {
+                        // Analyze a small window around the bin (e.g., ±2 bins)
+                        val windowStart = maxOf(0, binIndex - 2)
+                        val windowEnd = minOf(currentFFT.size - 1, binIndex + 2)
+
+                        val windowData = currentFFT.sliceArray(windowStart..windowEnd)
+                        val peakSignal = windowData.maxOrNull() ?: 0f
+                        val avgSignal = windowData.average().toFloat()
+
+                        // Apply detection mode
+                        val detected = when (mode) {
+                            ScanDetectionMode.PEAK_ONLY -> peakSignal > effectiveThreshold
+                            ScanDetectionMode.AVERAGE_ONLY -> avgSignal > effectiveThreshold
+                            ScanDetectionMode.PEAK_OR_AVERAGE -> peakSignal > effectiveThreshold || avgSignal > effectiveThreshold
+                        }
+
+                        if (detected) {
+                            detectedSignals.add(
+                                DiscoveredSignal(
+                                    id = 0,
+                                    scanResultId = 0,
+                                    frequency = currentFreq,
+                                    peakStrength = peakSignal,
+                                    averageStrength = avgSignal,
+                                    bandwidth = 0,
+                                    isGrouped = false
+                                )
+                            )
+                        }
+                    }
+
+                    currentFreq += stepSize
+                }
+
+            } finally {
+                fftProcessorData.lock.readLock().unlock()
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error detecting signals in FFT", e)
+        }
+
+        return detectedSignals
+    }
+
+    private fun groupSignals(signals: List<DiscoveredSignal>, stepSize: Long, minimumGap: Int): List<DiscoveredSignal> {
+        if (signals.isEmpty()) return emptyList()
+
+        // Sort signals by frequency
+        val sortedSignals = signals.sortedBy { it.frequency }
+        val groupedSignals = mutableListOf<DiscoveredSignal>()
+        val gapThreshold = stepSize * minimumGap
+
+        var currentGroup = mutableListOf<DiscoveredSignal>()
+        currentGroup.add(sortedSignals[0])
+
+        for (i in 1 until sortedSignals.size) {
+            val prevSignal = sortedSignals[i - 1]
+            val currentSignal = sortedSignals[i]
+            val gap = currentSignal.frequency - prevSignal.frequency
+
+            if (gap <= gapThreshold) {
+                // Signals are close, add to current group
+                currentGroup.add(currentSignal)
+            } else {
+                // Gap is too large, finalize current group and start new one
+                groupedSignals.add(finalizeGroup(currentGroup))
+                currentGroup = mutableListOf(currentSignal)
+            }
+        }
+
+        // Finalize last group
+        groupedSignals.add(finalizeGroup(currentGroup))
+
+        return groupedSignals
+    }
+
+    private fun finalizeGroup(group: List<DiscoveredSignal>): DiscoveredSignal {
+        if (group.size == 1) {
+            // Single signal, return as-is
+            return group[0]
+        }
+
+        // Multiple signals, create grouped signal
+        val minFreq = group.minOf { it.frequency }
+        val maxFreq = group.maxOf { it.frequency }
+        val centerFreq = (minFreq + maxFreq) / 2
+        val bandwidth = maxFreq - minFreq
+        val maxPeak = group.maxOf { it.peakStrength }
+        val avgOfAverages = group.map { it.averageStrength }.average().toFloat()
+
+        return DiscoveredSignal(
+            id = 0,
+            scanResultId = 0,
+            frequency = centerFreq,
+            peakStrength = maxPeak,
+            averageStrength = avgOfAverages,
+            bandwidth = bandwidth,
+            isGrouped = true
+        )
+    }
 
     val settingsTabActions = SettingsTabActions(
         onScreenOrientationChanged = appStateRepository.screenOrientation::set,
@@ -532,7 +1681,22 @@ class MainViewModel @Inject constructor(
                 if(!appStateRepository.analyzerRunning.value) {
                     appStateRepository.sourceType.set(SourceType.FILESOURCE)
                     appStateRepository.filesourceUri.set(recording.filePath)
-                    appStateRepository.filesourceFilename.set(File(recording.filePath).name)
+
+                    // Extract filename - handle both File paths and content:// URIs
+                    val filename = if (recording.filePath.startsWith("content://")) {
+                        try {
+                            val uri = Uri.parse(recording.filePath)
+                            val docFile = androidx.documentfile.provider.DocumentFile.fromSingleUri(context, uri)
+                            docFile?.name ?: "recording.iq"
+                        } catch (e: Exception) {
+                            Log.e(TAG, "playRecording: Error getting filename from URI: ${e.message}", e)
+                            "recording.iq"
+                        }
+                    } else {
+                        File(recording.filePath).name
+                    }
+                    appStateRepository.filesourceFilename.set(filename)
+
                     appStateRepository.sourceFrequency.set(recording.frequency)
                     appStateRepository.sourceSampleRate.set(recording.sampleRate)
                     appStateRepository.filesourceFileFormat.set(recording.fileFormat)
@@ -634,34 +1798,168 @@ class MainViewModel @Inject constructor(
             appStateRepository.analyzerEvents.collect { event ->
                 when (event) {
                     is AppStateRepository.AnalyzerEvent.RecordingFinished -> {
-                        val newRecording = Recording(
-                            name = appStateRepository.recordingName.value,
-                            frequency = appStateRepository.sourceFrequency.value,
-                            sampleRate = appStateRepository.sourceSampleRate.value,
-                            date = appStateRepository.recordingStartedTimestamp.value,
-                            fileFormat = when(appStateRepository.sourceType.value) {
-                                SourceType.HACKRF -> FilesourceFileFormat.HACKRF
-                                SourceType.RTLSDR -> FilesourceFileFormat.RTLSDR
-                                SourceType.AIRSPY -> FilesourceFileFormat.AIRSPY
-                                SourceType.HYDRASDR -> FilesourceFileFormat.HYDRASDR
-                                SourceType.FILESOURCE -> appStateRepository.filesourceFileFormat.value
-                            },
-                            sizeInBytes = event.finalSize,
-                            filePath = event.recordingFile.absolutePath,
-                            favorite = false
-                        )
-                        sendActionToUi(UiAction.RenameFile(event.recordingFile, newRecording.calculateFileName()))
-                        val newFilePath = "${event.recordingFile.parent}/${newRecording.calculateFileName()}"
-                        insertRecording(newRecording.copy(filePath = newFilePath)) { insertedRecording ->
-                            appStateRepository.recordingStartedTimestamp.set(0L)
-                            appStateRepository.recordingRunning.set(false)
-                            showSnackbar(SnackbarEvent(
-                                message = "Recording '${insertedRecording.name}' finished (${insertedRecording.sizeInBytes.asSizeInBytesToString()})",
-                                buttonText = "Delete Recording",
-                                callback = { askDeletionResult ->
-                                    if(askDeletionResult == SnackbarResult.ActionPerformed) deleteRecordingWithUndo(insertedRecording)
+                        val fileRef = event.recordingFileRef
+                        val customDirUri = appStateRepository.recordingDirectoryUri.value
+
+                        // Check if this is a split recording (list of files) or single file
+                        val isSplitRecording = fileRef is List<*>
+                        val fileRefs = if (isSplitRecording) {
+                            @Suppress("UNCHECKED_CAST")
+                            fileRef as List<Any>
+                        } else {
+                            listOf(fileRef)
+                        }
+
+                        Log.i(TAG, "RecordingFinished: Processing ${fileRefs.size} file(s), split=$isSplitRecording")
+
+                        // Helper function to generate final filename with optional split suffix
+                        fun generateFinalFilename(splitIndex: Int?): String {
+                            val baseName = Recording(
+                                name = appStateRepository.recordingName.value,
+                                frequency = appStateRepository.sourceFrequency.value,
+                                sampleRate = appStateRepository.sourceSampleRate.value,
+                                date = appStateRepository.recordingStartedTimestamp.value,
+                                fileFormat = when(appStateRepository.sourceType.value) {
+                                    SourceType.HACKRF -> FilesourceFileFormat.HACKRF
+                                    SourceType.RTLSDR -> FilesourceFileFormat.RTLSDR
+                                    SourceType.AIRSPY -> FilesourceFileFormat.AIRSPY
+                                    SourceType.HYDRASDR -> FilesourceFileFormat.HYDRASDR
+                                    SourceType.FILESOURCE -> appStateRepository.filesourceFileFormat.value
+                                },
+                                sizeInBytes = 0L,
+                                filePath = "",
+                                favorite = false
+                            ).calculateFileName()
+
+                            return if (splitIndex != null) {
+                                // Insert split suffix before .iq extension
+                                baseName.replace(".iq", "-${String.format("%03d", splitIndex)}.iq")
+                            } else {
+                                baseName
+                            }
+                        }
+
+                        // Process each file and collect final paths
+                        val finalFilePaths = mutableListOf<Pair<String, Long>>()
+                        fileRefs.forEachIndexed { index, singleFileRef ->
+                            val splitIndex = if (isSplitRecording) index + 1 else null
+                            val finalFilename = generateFinalFilename(splitIndex)
+
+                            val finalFilePath: String = if (singleFileRef is android.net.Uri) {
+                                // SAF file - rename it using the tree URI
+                                try {
+                                    val treeUri = android.net.Uri.parse(customDirUri)
+                                    val docTree = androidx.documentfile.provider.DocumentFile.fromTreeUri(context, treeUri)
+
+                                    if (docTree == null) {
+                                        Log.e(TAG, "RecordingFinished: Could not get directory DocumentFile from tree URI")
+                                        singleFileRef.toString()
+                                    } else {
+                                        // Find the temporary file in the directory
+                                        val tempFilename = if (isSplitRecording) {
+                                            "ongoing_recording_${String.format("%03d", index + 1)}.iq"
+                                        } else {
+                                            "ongoing_recording.iq"
+                                        }
+                                        val ongoingFile = docTree.findFile(tempFilename)
+
+                                        if (ongoingFile == null) {
+                                            Log.e(TAG, "RecordingFinished: Could not find $tempFilename in directory")
+                                            singleFileRef.toString()
+                                        } else {
+                                            val renamed = ongoingFile.renameTo(finalFilename)
+                                            if (renamed) {
+                                                Log.i(TAG, "RecordingFinished: Successfully renamed $tempFilename to $finalFilename")
+                                                ongoingFile.uri.toString()
+                                            } else {
+                                                Log.e(TAG, "RecordingFinished: Failed to rename $tempFilename to $finalFilename")
+                                                singleFileRef.toString()
+                                            }
+                                        }
+                                    }
+                                } catch (e: Exception) {
+                                    Log.e(TAG, "RecordingFinished: Exception while renaming SAF file: ${e.message}", e)
+                                    singleFileRef.toString()
                                 }
-                            ))
+                            } else if (singleFileRef is File) {
+                                // Internal storage file - rename
+                                sendActionToUi(UiAction.RenameFile(singleFileRef, finalFilename))
+                                "${singleFileRef.parent}/$finalFilename"
+                            } else {
+                                Log.e(TAG, "RecordingFinished: Unknown file reference type: ${singleFileRef.javaClass.name}")
+                                ""
+                            }
+
+                            // Get file size from SAF URI or File
+                            val fileSize = if (singleFileRef is android.net.Uri) {
+                                try {
+                                    val treeUri = android.net.Uri.parse(customDirUri)
+                                    val docTree = androidx.documentfile.provider.DocumentFile.fromTreeUri(context, treeUri)
+                                    docTree?.findFile(finalFilename)?.length() ?: 0L
+                                } catch (e: Exception) {
+                                    0L
+                                }
+                            } else if (singleFileRef is File) {
+                                File(singleFileRef.parent, finalFilename).length()
+                            } else {
+                                0L
+                            }
+
+                            finalFilePaths.add(Pair(finalFilePath, fileSize))
+                        }
+
+                        // Insert all recordings into database
+                        val totalSize = finalFilePaths.sumOf { it.second }
+                        finalFilePaths.forEachIndexed { index, (filePath, fileSize) ->
+                            val recording = Recording(
+                                name = appStateRepository.recordingName.value,
+                                frequency = appStateRepository.sourceFrequency.value,
+                                sampleRate = appStateRepository.sourceSampleRate.value,
+                                date = appStateRepository.recordingStartedTimestamp.value,
+                                fileFormat = when(appStateRepository.sourceType.value) {
+                                    SourceType.HACKRF -> FilesourceFileFormat.HACKRF
+                                    SourceType.RTLSDR -> FilesourceFileFormat.RTLSDR
+                                    SourceType.AIRSPY -> FilesourceFileFormat.AIRSPY
+                                    SourceType.HYDRASDR -> FilesourceFileFormat.HYDRASDR
+                                    SourceType.FILESOURCE -> appStateRepository.filesourceFileFormat.value
+                                },
+                                sizeInBytes = fileSize,
+                                filePath = filePath,
+                                favorite = false
+                            )
+
+                            insertRecording(recording) { insertedRecording ->
+                                // Only show notification and snackbar for the last file
+                                if (index == finalFilePaths.size - 1) {
+                                    appStateRepository.recordingStartedTimestamp.set(0L)
+                                    appStateRepository.recordingRunning.set(false)
+
+                                    val message = if (isSplitRecording) {
+                                        "Recording '${insertedRecording.name}' finished (${finalFilePaths.size} files, ${totalSize.asSizeInBytesToString()} total)"
+                                    } else {
+                                        "Recording '${insertedRecording.name}' finished (${totalSize.asSizeInBytesToString()})"
+                                    }
+
+                                    sendActionToUi(UiAction.ShowRecordingFinishedNotification(
+                                        insertedRecording.name,
+                                        totalSize
+                                    ))
+
+                                    showSnackbar(SnackbarEvent(
+                                        message = message,
+                                        buttonText = if (isSplitRecording) "View" else "Delete Recording",
+                                        callback = { result ->
+                                            if(result == SnackbarResult.ActionPerformed) {
+                                                if (isSplitRecording) {
+                                                    navigate(AppScreen.RecordingScreen)
+                                                } else {
+                                                    deleteRecordingWithUndo(insertedRecording)
+                                                }
+                                            }
+                                        }
+                                    ))
+                                }
+                            }
                         }
                     }
                     is AppStateRepository.AnalyzerEvent.SourceFailure ->

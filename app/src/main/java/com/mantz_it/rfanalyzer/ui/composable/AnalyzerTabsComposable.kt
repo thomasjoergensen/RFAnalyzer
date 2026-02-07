@@ -17,6 +17,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import com.mantz_it.rfanalyzer.database.AppStateRepository
 import com.mantz_it.rfanalyzer.database.BillingRepositoryInterface
+import com.mantz_it.rfanalyzer.database.IEMPreset
 import com.mantz_it.rfanalyzer.ui.MainViewModel
 
 /**
@@ -50,6 +51,9 @@ enum class AnalyzerTabs(val displayName: String) {
     SOURCE("Source"),
     DEMODULATION("Demodulation"),
     RECORDING("Recording"),
+    SCAN("Scan"),
+    IEM_PRESETS("IEM Presets"),
+    AIR_COMM("Air Comm"),
     DISPLAY("Display"),
     SETTINGS("Settings"),
     ABOUT("About")
@@ -65,6 +69,10 @@ fun AnalyzerTabsComposable(
     displayTabActions: DisplayTabActions,
     demodulationTabActions: DemodulationTabActions,
     recordingTabActions: RecordingTabActions,
+    scanTabActions: ScanTabActions,
+    iemPresetsTabActions: IEMPresetsTabActions,
+    availableIEMPresets: List<IEMPreset>,
+    airCommTabActions: AirCommTabActions,
     settingsTabActions: SettingsTabActions,
     aboutTabActions: AboutTabActions,
 ) {
@@ -143,6 +151,44 @@ fun AnalyzerTabsComposable(
     val recordingstopAfterUnit by appStateRepository.recordingstopAfterUnit.stateFlow.collectAsState()
     val recordingCurrentFileSize by appStateRepository.recordingCurrentFileSize.stateFlow.collectAsState()
     val recordingStartedTimestamp by appStateRepository.recordingStartedTimestamp.stateFlow.collectAsState()
+    val recordingDirectoryUri by appStateRepository.recordingDirectoryUri.stateFlow.collectAsState()
+    val autoResumeRecording by appStateRepository.autoResumeRecording.stateFlow.collectAsState()
+    val recordingSplitAt4GB by appStateRepository.recordingSplitAt4GB.stateFlow.collectAsState()
+    val scanRunning by appStateRepository.scanRunning.stateFlow.collectAsState()
+    val scanProgress by appStateRepository.scanProgress.stateFlow.collectAsState()
+    val currentScanFrequency by appStateRepository.currentScanFrequency.stateFlow.collectAsState()
+    val scanStartFrequency by appStateRepository.scanStartFrequency.stateFlow.collectAsState()
+    val scanEndFrequency by appStateRepository.scanEndFrequency.stateFlow.collectAsState()
+    val scanThreshold by appStateRepository.scanThreshold.stateFlow.collectAsState()
+    val scanStepSize by appStateRepository.scanStepSize.stateFlow.collectAsState()
+    val scanDwellTime by appStateRepository.scanDwellTime.stateFlow.collectAsState()
+    val scanDetectionMode by appStateRepository.scanDetectionMode.stateFlow.collectAsState()
+    val scanNoiseFloorMargin by appStateRepository.scanNoiseFloorMargin.stateFlow.collectAsState()
+    val scanEnableSignalGrouping by appStateRepository.scanEnableSignalGrouping.stateFlow.collectAsState()
+    val scanMinimumGap by appStateRepository.scanMinimumGap.stateFlow.collectAsState()
+    val discoveredSignals by appStateRepository.discoveredSignals.stateFlow.collectAsState()
+    val noiseFloorLevel by appStateRepository.noiseFloorLevel.stateFlow.collectAsState()
+    val iemSelectedPresetIds by appStateRepository.iemSelectedPresetIds.stateFlow.collectAsState()
+    val iemScanRunning by appStateRepository.iemScanRunning.stateFlow.collectAsState()
+    val iemScanProgress by appStateRepository.iemScanProgress.stateFlow.collectAsState()
+    val iemCurrentScanFrequency by appStateRepository.iemCurrentScanFrequency.stateFlow.collectAsState()
+    val iemDetectedChannels by appStateRepository.iemDetectedChannels.stateFlow.collectAsState()
+    val iemDetectionThreshold by appStateRepository.iemDetectionThreshold.stateFlow.collectAsState()
+    val iemNoiseFloorMargin by appStateRepository.iemNoiseFloorMargin.stateFlow.collectAsState()
+    val iemUseNoiseFloor by appStateRepository.iemUseNoiseFloor.stateFlow.collectAsState()
+    val airCommStartFrequency by appStateRepository.airCommStartFrequency.stateFlow.collectAsState()
+    val airCommEndFrequency by appStateRepository.airCommEndFrequency.stateFlow.collectAsState()
+    val airCommStepSize by appStateRepository.airCommStepSize.stateFlow.collectAsState()
+    val airCommDwellTime by appStateRepository.airCommDwellTime.stateFlow.collectAsState()
+    val airCommHangTime by appStateRepository.airCommHangTime.stateFlow.collectAsState()
+    val airCommDetectionThreshold by appStateRepository.airCommDetectionThreshold.stateFlow.collectAsState()
+    val airCommNoiseFloorMargin by appStateRepository.airCommNoiseFloorMargin.stateFlow.collectAsState()
+    val airCommUseNoiseFloor by appStateRepository.airCommUseNoiseFloor.stateFlow.collectAsState()
+    val airCommScanRunning by appStateRepository.airCommScanRunning.stateFlow.collectAsState()
+    val airCommCurrentFrequency by appStateRepository.airCommCurrentFrequency.stateFlow.collectAsState()
+    val airCommSignalDetected by appStateRepository.airCommSignalDetected.stateFlow.collectAsState()
+    val airCommSignalStrength by appStateRepository.airCommSignalStrength.stateFlow.collectAsState()
+    val airCommExceptionList by appStateRepository.airCommExceptionList.stateFlow.collectAsState()
     val screenOrientation by appStateRepository.screenOrientation.stateFlow.collectAsState()
     val fontSize by appStateRepository.fontSize.stateFlow.collectAsState()
     val colorTheme by appStateRepository.colorTheme.stateFlow.collectAsState()
@@ -276,7 +322,64 @@ fun AnalyzerTabsComposable(
                         currentRecordingFileSize = recordingCurrentFileSize,
                         recordingsTotalFileSize = totalRecordingSizeInBytes,
                         recordingStartedTimestamp = recordingStartedTimestamp,
+                        recordingDirectoryUri = recordingDirectoryUri,
+                        autoResumeRecording = autoResumeRecording,
+                        splitAt4GB = recordingSplitAt4GB,
                         recordingTabActions = recordingTabActions
+                    )
+                AnalyzerTabs.SCAN
+                    -> ScanTabComposable(
+                        analyzerRunning = analyzerRunning,
+                        recordingRunning = recordingRunning,
+                        scanRunning = scanRunning,
+                        scanProgress = scanProgress,
+                        currentScanFrequency = currentScanFrequency,
+                        startFrequency = scanStartFrequency,
+                        endFrequency = scanEndFrequency,
+                        threshold = scanThreshold,
+                        stepSize = scanStepSize,
+                        dwellTime = scanDwellTime,
+                        detectionMode = scanDetectionMode,
+                        noiseFloorMargin = scanNoiseFloorMargin,
+                        enableSignalGrouping = scanEnableSignalGrouping,
+                        minimumGap = scanMinimumGap,
+                        noiseFloor = noiseFloorLevel,
+                        discoveredSignals = discoveredSignals,
+                        scanTabActions = scanTabActions
+                    )
+                AnalyzerTabs.IEM_PRESETS
+                    -> IEMPresetsTabComposable(
+                        analyzerRunning = analyzerRunning,
+                        recordingRunning = recordingRunning,
+                        iemScanRunning = iemScanRunning,
+                        availablePresets = availableIEMPresets,
+                        selectedPresetIds = iemSelectedPresetIds,
+                        detectedChannels = iemDetectedChannels,
+                        scanProgress = iemScanProgress,
+                        currentFrequency = iemCurrentScanFrequency,
+                        detectionThreshold = iemDetectionThreshold,
+                        noiseFloorMargin = iemNoiseFloorMargin,
+                        useNoiseFloor = iemUseNoiseFloor,
+                        iemPresetsTabActions = iemPresetsTabActions
+                    )
+                AnalyzerTabs.AIR_COMM
+                    -> AirCommTabComposable(
+                        analyzerRunning = analyzerRunning,
+                        recordingRunning = recordingRunning,
+                        airCommScanRunning = airCommScanRunning,
+                        currentFrequency = airCommCurrentFrequency,
+                        signalDetected = airCommSignalDetected,
+                        signalStrength = airCommSignalStrength,
+                        startFrequency = airCommStartFrequency,
+                        endFrequency = airCommEndFrequency,
+                        stepSize = airCommStepSize,
+                        dwellTime = airCommDwellTime,
+                        hangTime = airCommHangTime,
+                        detectionThreshold = airCommDetectionThreshold,
+                        noiseFloorMargin = airCommNoiseFloorMargin,
+                        useNoiseFloor = airCommUseNoiseFloor,
+                        exceptionList = airCommExceptionList,
+                        airCommTabActions = airCommTabActions
                     )
                 AnalyzerTabs.SETTINGS
                     -> SettingsTabComposable(

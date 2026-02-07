@@ -72,6 +72,18 @@ tasks.register<Exec>("generateDocs") {
     group = "documentation"
     workingDir = file("$projectDir/../")
     commandLine("mkdocs", "build", "--clean", "--no-directory-urls", "--site-dir", "build_site")
+    isIgnoreExitValue = true
+    // Only run if mkdocs is available
+    onlyIf {
+        try {
+            val process = ProcessBuilder("mkdocs", "--version").start()
+            process.waitFor()
+            process.exitValue() == 0
+        } catch (e: Exception) {
+            println("mkdocs not found, skipping documentation generation")
+            false
+        }
+    }
 }
 tasks.register<Copy>("copyDocsToAssets") {
     dependsOn("generateDocs")
@@ -79,6 +91,8 @@ tasks.register<Copy>("copyDocsToAssets") {
         exclude("sitemap.xml.gz")  // Exclude the gz file as it causes problems when merging assets
     }
     into("$projectDir/src/main/assets/docs")
+    // Only copy if source exists (mkdocs ran successfully)
+    onlyIf { file("$projectDir/../build_site").exists() }
 }
 tasks.named("preBuild") {
     dependsOn("copyDocsToAssets")
@@ -118,6 +132,7 @@ dependencies {
     implementation(libs.androidx.security.crypto)
     implementation(libs.dagger.hilt)
     ksp(libs.dagger.hilt.compiler)
+    implementation(libs.androidx.documentfile)
 
     // Flavor-specific dependencies:
     add("playImplementation", libs.billing)  // "play" is the flavor

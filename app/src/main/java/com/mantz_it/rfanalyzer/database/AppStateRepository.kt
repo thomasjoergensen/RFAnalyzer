@@ -18,6 +18,7 @@ import com.mantz_it.rfanalyzer.ui.composable.FftDrawingType
 import com.mantz_it.rfanalyzer.ui.composable.FftWaterfallSpeed
 import com.mantz_it.rfanalyzer.ui.composable.FilesourceFileFormat
 import com.mantz_it.rfanalyzer.ui.composable.FontSize
+import com.mantz_it.rfanalyzer.ui.composable.ScanDetectionMode
 import com.mantz_it.rfanalyzer.ui.composable.ScreenOrientation
 import com.mantz_it.rfanalyzer.ui.composable.SourceType
 import com.mantz_it.rfanalyzer.ui.composable.StopAfterUnit
@@ -237,6 +238,27 @@ class AppStateRepository @Inject constructor(
     val recordingstopAfterUnit = Setting("recordingStopAfterUnit", StopAfterUnit.NEVER, scope, dataStore)
     val recordingCurrentFileSize = MutableState(0L)
     val recordingStartedTimestamp = MutableState(0L)
+    val recordingDirectoryUri = Setting("recordingDirectoryUri", "", scope, dataStore) // Empty = use internal storage, otherwise SAF content:// URI
+    val autoResumeRecording = Setting("autoResumeRecording", false, scope, dataStore) // Auto-start new recording when USB device reconnects
+    val wasRecordingBeforeDisconnect = MutableState(false) // Runtime flag to track if recording was active before USB disconnect
+    val recordingSplitAt4GB = Setting("recordingSplitAt4GB", false, scope, dataStore) // Split recording files at 4GB for FAT32 compatibility
+
+    // Scan Tab
+    val scanStartFrequency = Setting("scanStartFrequency", 400000000L, scope, dataStore) // 400 MHz
+    val scanEndFrequency = Setting("scanEndFrequency", 700000000L, scope, dataStore) // 700 MHz
+    val scanThreshold = Setting("scanThreshold", -60f, scope, dataStore) // -60 dB
+    val scanStepSize = Setting("scanStepSize", 1000000L, scope, dataStore) // 1 MHz
+    val scanDwellTime = Setting("scanDwellTime", 200L, scope, dataStore) // 200 ms
+    val scanDetectionMode = Setting("scanDetectionMode", ScanDetectionMode.PEAK_ONLY, scope, dataStore)
+    val scanNoiseFloorMargin = Setting("scanNoiseFloorMargin", 10f, scope, dataStore) // dB above noise floor
+    val scanEnableSignalGrouping = Setting("scanEnableSignalGrouping", true, scope, dataStore)
+    val scanMinimumGap = Setting("scanMinimumGap", 2, scope, dataStore) // Minimum gap in multiples of step size
+    val scanRunning = MutableState(false)
+    val scanProgress = MutableState(0f) // 0.0 to 1.0
+    val currentScanFrequency = MutableState(0L)
+    val discoveredSignals = MutableState<List<DiscoveredSignal>>(emptyList())
+    val currentScanResultId = MutableState<Long?>(null) // ID of the current scan result in database
+    val noiseFloorLevel = MutableState(-999f) // Estimated noise floor in dB
 
     // Settings Tab
     val screenOrientation = Setting("screenOrientation", ScreenOrientation.AUTO, scope, dataStore)
@@ -247,6 +269,33 @@ class AppStateRepository @Inject constructor(
     val controlDrawerSide = Setting("controlDrawerSide", ControlDrawerSide.RIGHT, scope, dataStore)
     val longPressHelpEnabled = Setting("longPressHelpEnabled", true, scope, dataStore)
     val reverseTuningWheel = Setting("reverseTuningWheel", false, scope, dataStore)
+
+    // IEM Presets
+    val iemPresetsPopulated = Setting("iemPresetsPopulated", false, scope, dataStore)
+    val iemSelectedPresetIds = MutableState<Set<Long>>(emptySet()) // Selected presets for scanning
+    val iemDetectionThreshold = Setting("iemDetectionThreshold", -40f, scope, dataStore) // Configurable threshold in dB
+    val iemNoiseFloorMargin = Setting("iemNoiseFloorMargin", 15f, scope, dataStore) // Margin above noise floor
+    val iemUseNoiseFloor = Setting("iemUseNoiseFloor", true, scope, dataStore) // Use noise floor estimation vs fixed threshold
+    val iemScanRunning = MutableState(false)
+    val iemScanProgress = MutableState(0f) // 0.0 to 1.0
+    val iemCurrentScanFrequency = MutableState(0L)
+    val iemDetectedChannels = MutableState<List<IEMDetectedChannelInfo>>(emptyList())
+    val iemCurrentScanResultId = MutableState<Long?>(null) // ID of the current scan result in database
+
+    // Air Communication Scanner
+    val airCommStartFrequency = Setting("airCommStartFrequency", 118000000L, scope, dataStore) // 118 MHz - Aviation VHF start
+    val airCommEndFrequency = Setting("airCommEndFrequency", 137000000L, scope, dataStore) // 137 MHz - Aviation VHF end
+    val airCommStepSize = Setting("airCommStepSize", 25000L, scope, dataStore) // 25 kHz step (standard aviation spacing)
+    val airCommDwellTime = Setting("airCommDwellTime", 100L, scope, dataStore) // 100ms dwell time per frequency
+    val airCommHangTime = Setting("airCommHangTime", 3000L, scope, dataStore) // 3 seconds hang time after signal drops
+    val airCommDetectionThreshold = Setting("airCommDetectionThreshold", -40f, scope, dataStore) // -40 dB threshold
+    val airCommNoiseFloorMargin = Setting("airCommNoiseFloorMargin", 15f, scope, dataStore) // 15 dB margin above noise floor
+    val airCommUseNoiseFloor = Setting("airCommUseNoiseFloor", true, scope, dataStore) // Use adaptive noise floor detection
+    val airCommScanRunning = MutableState(false) // Is scanner actively running
+    val airCommCurrentFrequency = MutableState(0L) // Current frequency being scanned
+    val airCommSignalDetected = MutableState(false) // Is scanner paused on a signal
+    val airCommSignalStrength = MutableState(-999f) // Current signal strength in dB
+    val airCommExceptionList = MutableState<Set<Long>>(emptySet()) // Frequencies to skip during scanning
 
     // Recordings Screen
     val displayOnlyFavoriteRecordings = Setting("displayOnlyFavoriteRecordings", false, scope, dataStore)
@@ -293,7 +342,7 @@ class AppStateRepository @Inject constructor(
     private val _analyzerEvents = MutableSharedFlow<AnalyzerEvent?>()
     val analyzerEvents: SharedFlow<AnalyzerEvent?> = _analyzerEvents
     sealed class AnalyzerEvent {
-        data class RecordingFinished(val finalSize: Long, val recordingFile: File): AnalyzerEvent()
+        data class RecordingFinished(val finalSize: Long, val recordingFileRef: Any): AnalyzerEvent()  // Can be File or Uri
         data class SourceFailure(val message: String): AnalyzerEvent()
     }
     fun emitAnalyzerEvent(event: AnalyzerEvent){ scope.launch { _analyzerEvents.emit(event) } }

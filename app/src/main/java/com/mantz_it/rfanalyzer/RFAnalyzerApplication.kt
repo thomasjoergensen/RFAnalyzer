@@ -3,7 +3,15 @@ package com.mantz_it.rfanalyzer
 import android.app.Application
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.util.Log
+import com.mantz_it.rfanalyzer.database.AppStateRepository
+import com.mantz_it.rfanalyzer.database.IEMPresetPopulator
 import dagger.hilt.android.HiltAndroidApp
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
+import javax.inject.Inject
 
 /**
  * <h1>RF Analyzer - Application Class</h1>
@@ -34,18 +42,69 @@ import dagger.hilt.android.HiltAndroidApp
 
 @HiltAndroidApp
 class RFAnalyzerApplication : Application() {
+    @Inject
+    lateinit var iemPresetPopulator: IEMPresetPopulator
+
+    @Inject
+    lateinit var appStateRepository: AppStateRepository
+
+    private val applicationScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    companion object {
+        private const val TAG = "RFAnalyzerApplication"
+    }
+
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
+        initializeIEMPresets()
+    }
+
+    /**
+     * Populate IEM presets database on first app launch
+     */
+    private fun initializeIEMPresets() {
+        applicationScope.launch {
+            try {
+                // Wait for settings to load first
+                appStateRepository.blockUntilAllSettingsLoaded()
+
+                // Check if already populated
+                if (!appStateRepository.iemPresetsPopulated.value) {
+                    Log.i(TAG, "First launch detected - populating IEM presets database...")
+                    iemPresetPopulator.populateIfEmpty()
+                    appStateRepository.iemPresetsPopulated.set(true)
+                    Log.i(TAG, "IEM presets database initialized successfully")
+                } else {
+                    Log.d(TAG, "IEM presets already populated, skipping initialization")
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Error initializing IEM presets: ${e.message}", e)
+            }
+        }
     }
 
     private fun createNotificationChannel() {
+        val manager = getSystemService(NotificationManager::class.java)
+
+        // Channel for foreground service (low priority, no vibration)
         val serviceChannel = NotificationChannel(
             "SERVICE_CHANNEL",
             "Foreground Service Channel",
             NotificationManager.IMPORTANCE_LOW
         )
-        val manager = getSystemService(NotificationManager::class.java)
         manager.createNotificationChannel(serviceChannel)
+
+        // Channel for recording events (high priority, enables vibration for smartwatch)
+        val recordingChannel = NotificationChannel(
+            "RECORDING_CHANNEL",
+            "Recording Events",
+            NotificationManager.IMPORTANCE_HIGH
+        ).apply {
+            description = "Notifications for recording start/stop events"
+            enableVibration(true)
+            vibrationPattern = longArrayOf(0, 250, 250, 250)  // Vibrate: 250ms on, 250ms off, 250ms on
+        }
+        manager.createNotificationChannel(recordingChannel)
     }
 }

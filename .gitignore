@@ -25,3 +25,4 @@ app/src/main/assets/docs
 # Vim and ctags
 tags
 *.swp
+hs_err_pid14588.log

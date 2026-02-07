@@ -84,6 +84,11 @@ class AnalyzerService : Service() {
     var fftProcessor: FftProcessor? = null
         private set
 
+    // Recording state for file splitting
+    private var recordingSplitFiles = mutableListOf<Any>() // List of file references (File or Uri) for split recording
+    private var recordingUsingSAF = false // Whether current recording uses Storage Access Framework
+    private var recordingDirectory: Any? = null // DocumentFile or File representing recording directory
+
     inner class LocalBinder : Binder() {
         fun getService(): AnalyzerService = this@AnalyzerService
     }
@@ -362,6 +367,33 @@ class AnalyzerService : Service() {
             (source as RtlsdrSource).ifGain = appStateRepository.rtlsdrIFGainSteps.value[appStateRepository.rtlsdrIFGainIndex.value]
         }
 
+        // workaround for bug: when airspy is started, the gain values are not applied. so trigger re-application here
+        if (source is AirspySource) {
+            val airspySource = source as AirspySource
+            serviceScope.launch {
+                delay(100) // Wait for device to stabilize
+
+                // Re-apply gain settings - only apply the active gain to avoid conflicts
+                // (linearity and sensitivity gains are mutually exclusive, last one called wins)
+                if (appStateRepository.airspyAdvancedGainEnabled.value) {
+                    // Advanced gain mode - apply all three gains
+                    airspySource.lnaGain = appStateRepository.airspyLnaGain.value
+                    airspySource.mixerGain = appStateRepository.airspyMixerGain.value
+                    airspySource.vgaGain = appStateRepository.airspyVgaGain.value
+                    Log.i(TAG, "startAnalyzer: Re-applied Airspy advanced gains (LNA=${appStateRepository.airspyLnaGain.value}, Mixer=${appStateRepository.airspyMixerGain.value}, VGA=${appStateRepository.airspyVgaGain.value})")
+                } else {
+                    // Simple gain mode - only apply the non-zero gain (linearity or sensitivity)
+                    if (appStateRepository.airspyLinearityGain.value > 0) {
+                        airspySource.linearityGain = appStateRepository.airspyLinearityGain.value
+                        Log.i(TAG, "startAnalyzer: Re-applied Airspy linearity gain: ${appStateRepository.airspyLinearityGain.value}")
+                    } else {
+                        airspySource.sensitivityGain = appStateRepository.airspySensitivityGain.value
+                        Log.i(TAG, "startAnalyzer: Re-applied Airspy sensitivity gain: ${appStateRepository.airspySensitivityGain.value}")
+                    }
+                }
+            }
+        }
+
         return true
     }
 
@@ -555,17 +587,126 @@ class AnalyzerService : Service() {
         }
     }
 
+    /**
+     * Helper function to create a new recording file (for initial file or file splits)
+     */
+    private fun createRecordingFile(fileIndex: Int): Pair<BufferedOutputStream, Any>? {
+        val splitSuffix = if (appStateRepository.recordingSplitAt4GB.value) {
+            String.format("_%03d", fileIndex)
+        } else {
+            ""
+        }
+        val filename = "ongoing_recording${splitSuffix}.iq"
+
+        return if (recordingUsingSAF) {
+            try {
+                val docTree = recordingDirectory as? androidx.documentfile.provider.DocumentFile
+                if (docTree == null || !docTree.canWrite()) {
+                    Log.e(TAG, "createRecordingFile: Cannot write to recording directory")
+                    return null
+                }
+
+                // Delete existing file if it exists
+                val existingFile = docTree.findFile(filename)
+                existingFile?.delete()
+
+                // Create new file
+                val docFile = docTree.createFile("application/octet-stream", filename)
+                if (docFile == null) {
+                    Log.e(TAG, "createRecordingFile: Failed to create file: $filename")
+                    return null
+                }
+
+                val outputStream = contentResolver.openOutputStream(docFile.uri)
+                if (outputStream == null) {
+                    Log.e(TAG, "createRecordingFile: Failed to open output stream for file: $filename")
+                    return null
+                }
+
+                Log.i(TAG, "createRecordingFile: Created SAF file: ${docFile.uri} (index=$fileIndex)")
+                Pair(BufferedOutputStream(outputStream), docFile.uri)
+            } catch (e: Exception) {
+                Log.e(TAG, "createRecordingFile: Error creating SAF file: ${e.message}", e)
+                null
+            }
+        } else {
+            // Internal storage
+            try {
+                val dir = recordingDirectory as? File
+                if (dir == null || !dir.canWrite()) {
+                    Log.e(TAG, "createRecordingFile: Cannot write to recording directory")
+                    return null
+                }
+
+                val file = File(dir, filename)
+                Log.i(TAG, "createRecordingFile: Created internal storage file: ${file.absolutePath} (index=$fileIndex)")
+                Pair(BufferedOutputStream(FileOutputStream(file)), file)
+            } catch (e: Exception) {
+                Log.e(TAG, "createRecordingFile: Error creating internal storage file: ${e.message}", e)
+                null
+            }
+        }
+    }
+
     fun startRecording() {
         if (appStateRepository.recordingRunning.value) {
             Log.w(TAG, "startRecording: Recording is already running. do nothing..")
             return
         }
         val recordingStartedTimestamp = System.currentTimeMillis()
-        val filename = "ongoing_recording.iq"
-        val filepath = "$RECORDINGS_DIRECTORY/$filename"
-        Log.i(TAG, "startRecording: Opening file $filepath")
-        val file = File(this.filesDir, filepath)
-        val bufferedOutputStream = BufferedOutputStream(FileOutputStream(file))
+
+        // Initialize recording state
+        recordingSplitFiles.clear()
+
+        // Check if user has selected custom directory via SAF
+        val customDirUriStr = appStateRepository.recordingDirectoryUri.value
+        recordingUsingSAF = customDirUriStr.isNotEmpty()
+
+        // Set up directory reference for creating files
+        recordingDirectory = if (recordingUsingSAF) {
+            try {
+                val treeUri = android.net.Uri.parse(customDirUriStr)
+                val docTree = androidx.documentfile.provider.DocumentFile.fromTreeUri(this, treeUri)
+
+                if (docTree == null || !docTree.canWrite()) {
+                    Log.e(TAG, "startRecording: Cannot write to selected directory")
+                    appStateRepository.emitAnalyzerEvent(
+                        AppStateRepository.AnalyzerEvent.SourceFailure(
+                            "Cannot write to recording directory. Please re-select folder in Recording tab."
+                        )
+                    )
+                    return
+                }
+                docTree
+            } catch (e: Exception) {
+                Log.e(TAG, "startRecording: Error accessing custom directory: ${e.message}", e)
+                appStateRepository.emitAnalyzerEvent(
+                    AppStateRepository.AnalyzerEvent.SourceFailure(
+                        "Error accessing recording directory: ${e.message}"
+                    )
+                )
+                return
+            }
+        } else {
+            // Internal storage directory
+            val dir = File(this.filesDir, RECORDINGS_DIRECTORY)
+            if (!dir.exists()) dir.mkdirs()
+            dir
+        }
+
+        // Create initial recording file (index 1 if splitting, or no suffix if not)
+        val outputStreamAndRef = createRecordingFile(1)
+        if (outputStreamAndRef == null) {
+            Log.e(TAG, "startRecording: Failed to create initial recording file")
+            appStateRepository.emitAnalyzerEvent(
+                AppStateRepository.AnalyzerEvent.SourceFailure("Failed to create recording file")
+            )
+            return
+        }
+
+        val (bufferedOutputStream, fileRef) = outputStreamAndRef
+        recordingSplitFiles.add(fileRef)
+
         var maxRecordingTimeMilliseconds: Long? = null
         var maxRecordingFileSizeBytes: Long? = null
         when(appStateRepository.recordingstopAfterUnit.value) {
@@ -580,8 +721,30 @@ class AnalyzerService : Service() {
             onlyWhenSquelchIsSatisfied = appStateRepository.recordOnlyWhenSquelchIsSatisfied.value,
             maxRecordingTime = maxRecordingTimeMilliseconds,
             maxRecordingFileSize = maxRecordingFileSizeBytes,
-            onRecordingStopped = { finalSize -> appStateRepository.emitAnalyzerEvent(AppStateRepository.AnalyzerEvent.RecordingFinished(finalSize, file)) },
-            onFileSizeUpdate = appStateRepository.recordingCurrentFileSize::set
+            onRecordingStopped = { finalSize ->
+                // For split recordings, pass list of all files; otherwise pass single file
+                val finalFileRef = if (recordingSplitFiles.size > 1) {
+                    recordingSplitFiles.toList() // Return list of all split files
+                } else {
+                    fileRef // Return single file reference
+                }
+                appStateRepository.emitAnalyzerEvent(AppStateRepository.AnalyzerEvent.RecordingFinished(finalSize, finalFileRef))
+            },
+            onFileSizeUpdate = appStateRepository.recordingCurrentFileSize::set,
+            splitAt4GB = appStateRepository.recordingSplitAt4GB.value,
+            onFileSplit = { fileIndex, fileSize ->
+                Log.i(TAG, "onFileSplit: File $fileIndex completed with size $fileSize bytes")
+                // Create next split file
+                val nextFileIndex = fileIndex + 1
+                val result = createRecordingFile(nextFileIndex)
+                if (result != null) {
+                    recordingSplitFiles.add(result.second)
+                    result.first
+                } else {
+                    Log.e(TAG, "onFileSplit: Failed to create file $nextFileIndex")
+                    null
+                }
+            }
         )
         // update ui
         appStateRepository.recordingStartedTimestamp.set(recordingStartedTimestamp)

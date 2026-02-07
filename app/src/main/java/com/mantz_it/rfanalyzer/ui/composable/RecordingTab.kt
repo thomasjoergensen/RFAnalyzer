@@ -90,7 +90,10 @@ data class RecordingTabActions(
     val onStopAfterThresholdChanged: (Int) -> Unit,
     val onStopAfterUnitChanged: (StopAfterUnit) -> Unit,
     val onStartRecordingClicked: () -> Unit,
-    val onViewRecordingsClicked: () -> Unit
+    val onViewRecordingsClicked: () -> Unit,
+    val onChooseRecordingDirectoryClicked: () -> Unit,
+    val onAutoResumeRecordingChanged: (Boolean) -> Unit,
+    val onSplitAt4GBChanged: (Boolean) -> Unit
 )
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -111,6 +114,9 @@ fun RecordingTabComposable(
     currentRecordingFileSize: Long,
     recordingsTotalFileSize: Long,
     recordingStartedTimestamp: Long,
+    recordingDirectoryUri: String,
+    autoResumeRecording: Boolean,
+    splitAt4GB: Boolean,
     recordingTabActions: RecordingTabActions
 ) {
     var currentTime by remember { mutableStateOf(System.currentTimeMillis()) }
@@ -136,6 +142,29 @@ fun RecordingTabComposable(
                 Icon(
                     imageVector = Icons.Default.Menu,
                     contentDescription = "View Recordings"
+                )
+            }
+        }
+        Button(
+            onClick = recordingTabActions.onChooseRecordingDirectoryClicked,
+            shape = MaterialTheme.shapes.small,
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(55.dp)
+                .padding(vertical = 3.dp)
+        ) {
+            Row {
+                Icon(
+                    painter = painterResource(R.drawable.folder_open),
+                    contentDescription = "Choose Folder",
+                    modifier = Modifier.padding(end = 8.dp)
+                )
+                Text(
+                    text = if (recordingDirectoryUri.isEmpty())
+                        "Choose Recording Folder"
+                    else
+                        "Recording Folder: Custom",
+                    modifier = Modifier.padding(horizontal = 8.dp)
                 )
             }
         }
@@ -203,6 +232,21 @@ fun RecordingTabComposable(
             enabled = !recordingRunning,
             helpSubPath = "recording.html#stop-recording-after",
             modifier = Modifier.fillMaxWidth()
+        )
+        OutlinedSwitch(
+            label = "Auto-resume recording on USB reconnection",
+            helpText = "Automatically start a new recording when USB device reconnects after disconnection during recording",
+            isChecked = autoResumeRecording,
+            onCheckedChange = recordingTabActions.onAutoResumeRecordingChanged,
+            enabled = !recordingRunning
+        )
+        OutlinedSwitch(
+            label = "Split files at 4GB (FAT32 compatibility)",
+            helpText = "Automatically split recording into multiple files when reaching 4GB. Files are numbered sequentially (-001, -002, etc.) with gapless transitions.",
+            isChecked = splitAt4GB,
+            onCheckedChange = recordingTabActions.onSplitAt4GBChanged,
+            enabled = !recordingRunning,
+            helpSubPath = "recording.html#split-files"
         )
         Column(modifier = Modifier.fillMaxWidth()) {
             Text("Recordings occupy ${(recordingsTotalFileSize+currentRecordingFileSize).asSizeInBytesToString()} of Device Storage",
@@ -332,6 +376,9 @@ fun RecordingTabPreview() {
                 currentRecordingFileSize = 0,
                 recordingsTotalFileSize = 0,
                 recordingStartedTimestamp = 0,
+                recordingDirectoryUri = "",
+                autoResumeRecording = false,
+                splitAt4GB = false,
                 recordingTabActions = RecordingTabActions(
                     onNameChanged = { },
                     onOnlyRecordWhenSquelchIsSatisfiedChanged = { },
@@ -339,7 +386,10 @@ fun RecordingTabPreview() {
                     onStopAfterThresholdChanged = { },
                     onStopAfterUnitChanged = { },
                     onStartRecordingClicked = { },
-                    onViewRecordingsClicked = { }
+                    onViewRecordingsClicked = { },
+                    onChooseRecordingDirectoryClicked = { },
+                    onAutoResumeRecordingChanged = { },
+                    onSplitAt4GBChanged = { }
                 ),
             )
         }
